@@ -67,7 +67,7 @@ func (s *Scanner) pollAll(ctx context.Context) {
 }
 
 func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
-	pools, err := meteora.FetchTopPools(s.cfg.DiscoverURL, mp.Timeframe)
+	pools, err := meteora.FetchTopPools(s.cfg.DiscoverURL, mp)
 	if err != nil {
 		log.Printf("scanner[%s]: fetch error: %v", mp.Mode, err)
 		return

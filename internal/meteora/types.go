@@ -46,13 +46,24 @@ type Pool struct {
 	PoolAddress          string     `json:"pool_address"`
 	Name                 string     `json:"name"`
 	TVL                  float64    `json:"tvl"`
+	ActiveTVL            float64    `json:"active_tvl"`
 	FeeTVLRatio          float64    `json:"fee_tvl_ratio"`
 	FeeActiveTVLRatio    float64    `json:"fee_active_tvl_ratio"`
 	FeeTVLRatioChangePct float64    `json:"fee_tvl_ratio_change_pct"`
+	VolumeActiveTVLRatio float64    `json:"volume_active_tvl_ratio"`
+	UniqueLPs            float64    `json:"unique_lps"`
+	PositionsCreated     float64    `json:"positions_created"`
 	Volatility           float64    `json:"volatility"`
 	TokenX               Token      `json:"token_x"`
 	TokenY               Token      `json:"token_y"`
 	DlmmParams           DlmmParams `json:"dlmm_params"`
+
+	// Authoritative risk flags from the discovery API (cheaper + more reliable
+	// than parsing the warnings array). Ported from Meridian getRawPoolScreeningRejectReason.
+	HasCriticalWarnings        bool `json:"base_token_has_critical_warnings"`
+	QuoteHasCriticalWarnings   bool `json:"quote_token_has_critical_warnings"`
+	HasHighSingleOwnership     bool `json:"base_token_has_high_single_ownership"`
+	HasHighSupplyConcentration bool `json:"base_token_has_high_supply_concentration"`
 }
 
 // discoverResponse is the top-level discovery API envelope.
