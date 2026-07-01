@@ -228,8 +228,8 @@ def get_open_positions():
     data, err = run_command_json(f"node {EXECUTOR_PATH} positions")
     return data if isinstance(data, list) else []
 
-def fetch_top_pools(timeframe="24h"):
-    url = f"https://pool-discovery-api.datapi.meteora.ag/pools?page_size=50&timeframe={timeframe}&category=trending"
+def fetch_top_pools(timeframe="24h", page_size=50):
+    url = f"https://pool-discovery-api.datapi.meteora.ag/pools?page_size={page_size}&timeframe={timeframe}&category=trending"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -581,6 +581,7 @@ def main():
     parser.add_argument("--analyze-only", action="store_true", help="Screen pools, print all candidates JSON, exit without deploying")
     parser.add_argument("--strategy", type=str, default=None, help="Override SOUL.md strategy (spot, custom_ratio_spot, single_sided_reseed, fee_compounding, partial_harvest)")
     parser.add_argument("--pool", type=str, default=None, help="Deploy a specific pool address instead of auto-selecting winner")
+    parser.add_argument("--from-signal", dest="from_signal", type=str, default=None, help="JSON of a pre-screened candidate record from the mds signal daemon. Skips discovery+screen and deploys this exact pool; live gates (holding/cooldown/momentum/rent) still run.")
     parser.add_argument("--mode", type=str, default="multiday", choices=["casual", "multiday"], help="Pipeline mode: casual (30m, 2-6h plays) or multiday (24h, 24h+ holds)")
     cli = parser.parse_args()
 
@@ -628,13 +629,27 @@ def main():
         sys.exit(0)
 
     # 2. Fetch candidates
-    pools = fetch_top_pools(timeframe)
-    if not pools:
-        print("No candidates fetched from Meteora Pool Discovery API")
-        sys.exit(0)
+    if cli.from_signal:
+        # mds signal daemon already discovered + screened this pool; deploy the
+        # forwarded record directly. Skipping our own discovery/screen removes the
+        # divergence between two independent trending snapshots that used to cause
+        # "--pool ... not found in valid candidates. Aborting." The live gates below
+        # (open positions, cooldown, momentum, bin-array rent) still run.
+        try:
+            candidates = [json.loads(cli.from_signal)]
+        except Exception as e:
+            print(f"Aborting: --from-signal is not valid JSON: {e}")
+            sys.exit(1)
+        print(f"Using signalled candidate {candidates[0].get('name')} ({candidates[0].get('pool')}) — discovery/screen skipped")
+        pools = []
+    else:
+        pools = fetch_top_pools(timeframe)
+        if not pools:
+            print("No candidates fetched from Meteora Pool Discovery API")
+            sys.exit(0)
+        candidates = []
 
-    # 3. Filter candidates
-    candidates = []
+    # 3. Filter candidates (loop no-ops for --from-signal since pools == [])
     for p in pools:
         token_x = p.get("token_x", {})
         token_y = p.get("token_y", {})

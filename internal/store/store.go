@@ -32,13 +32,16 @@ func New(addr, key string, ttl time.Duration) *Seen {
 // (true == first time we've seen it, caller should emit a signal).
 func (s *Seen) MarkIfNew(ctx context.Context, id string) (bool, error) {
 	if s.rdb != nil {
-		added, err := s.rdb.SAdd(ctx, s.key, id).Result()
+		// One key per pool with its own TTL. A Redis SET can only expire as a
+		// whole, so the old SAdd+Expire refreshed the entire set's TTL on every
+		// write — the rolling window never lapsed while the scanner kept polling,
+		// so once-seen pools were deduped forever and never re-signalled.
+		// SetNX gives each pool an independent SEEN_TTL window that actually ages out.
+		ok, err := s.rdb.SetNX(ctx, s.key+":"+id, 1, s.ttl).Result()
 		if err != nil {
 			return false, err
 		}
-		// Refresh TTL on the set each write (rolling window).
-		s.rdb.Expire(ctx, s.key, s.ttl)
-		return added == 1, nil
+		return ok, nil
 	}
 
 	s.mu.Lock()
@@ -61,7 +64,7 @@ func (s *Seen) MarkIfNew(ctx context.Context, id string) (bool, error) {
 // poll. Called when webhook delivery fails after MarkIfNew already recorded it.
 func (s *Seen) Unmark(ctx context.Context, id string) {
 	if s.rdb != nil {
-		s.rdb.SRem(ctx, s.key, id)
+		s.rdb.Del(ctx, s.key+":"+id)
 		return
 	}
 	s.mu.Lock()

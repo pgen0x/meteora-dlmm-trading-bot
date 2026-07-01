@@ -2,7 +2,9 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/meteora-dlmm-signal/internal/config"
@@ -10,6 +12,15 @@ import (
 	"github.com/meteora-dlmm-signal/internal/store"
 	"github.com/meteora-dlmm-signal/internal/webhook"
 )
+
+// batchSummary renders a compact "SYM(score)" list for one log line.
+func batchSummary(batch []*meteora.Candidate) string {
+	parts := make([]string, 0, len(batch))
+	for _, c := range batch {
+		parts = append(parts, fmt.Sprintf("%s(%.0f)", c.BaseSymbol, c.Score))
+	}
+	return strings.Join(parts, ", ")
+}
 
 // Scanner polls the Meteora discovery API for each enabled mode, screens pools,
 // dedups, and forwards newly-qualifying pools to the Hermes webhook.
@@ -75,7 +86,14 @@ func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
 
 	// Per-poll tally so a quiet cycle logs "scanned N, 0 passed" instead of
 	// nothing — distinguishes "working, nothing qualified" from "API empty".
-	var screened, deduped, momRejected, sent int
+	var screened, deduped, momRejected int
+
+	// Batch mode: collect every fresh, momentum-passing candidate this cycle and
+	// emit ONE signal carrying the whole array. The agent then compares the set,
+	// picks the strongest pool + strategy, and deploys — instead of first-come
+	// per-pool sends where a mediocre early pool grabs a slot the best pool wanted.
+	var batch []*meteora.Candidate
+	var batchKeys []string
 	for _, p := range pools {
 		cand, reason := meteora.Screen(p, mp)
 		if reason != "" {
@@ -96,7 +114,9 @@ func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
 			continue
 		}
 
-		// Momentum / downtrend gate (best-effort, fail-open).
+		// Momentum / downtrend gate (best-effort, fail-open). Momentum-rejected
+		// pools stay marked seen (no unmark) so we don't re-hit DexScreener for
+		// them every cycle within the SEEN_TTL window.
 		if s.cfg.EnableMomentumGate {
 			if m, ok := meteora.GetMomentum(cand.BaseMint); ok {
 				if r := meteora.MomentumReject(m); r != "" {
@@ -107,16 +127,23 @@ func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
 			}
 		}
 
-		if err := s.fwd.Send("meteora_pool_discovery", cand, time.Now().Unix()); err != nil {
-			// Delivery failed — unmark so this pool retries on the next poll
-			// instead of being silently dropped for the whole SEEN_TTL window.
-			s.seen.Unmark(ctx, poolKey)
-			log.Printf("scanner[%s]: webhook error for %s (will retry): %v", mp.Mode, cand.BaseSymbol, err)
-			continue
+		batch = append(batch, cand)
+		batchKeys = append(batchKeys, poolKey)
+	}
+
+	sent := 0
+	if len(batch) > 0 {
+		if err := s.fwd.Send("meteora_pool_discovery", batch, time.Now().Unix()); err != nil {
+			// Delivery failed — unmark the whole batch so these pools retry on the
+			// next poll instead of being silently dropped for the SEEN_TTL window.
+			for _, k := range batchKeys {
+				s.seen.Unmark(ctx, k)
+			}
+			log.Printf("scanner[%s]: webhook error for batch of %d (will retry): %v", mp.Mode, len(batch), err)
+		} else {
+			sent = len(batch)
+			log.Printf("scanner[%s]: SIGNAL batch sent %d pools: %s", mp.Mode, sent, batchSummary(batch))
 		}
-		sent++
-		log.Printf("scanner[%s]: SIGNAL sent %s pool=%s TVL=$%.0f fee/TVL=%.2f%% score=%.1f",
-			mp.Mode, cand.BaseSymbol, cand.Pool[:8], cand.TVL, cand.FeeTVLRatio, cand.Score)
 	}
 
 	log.Printf("scanner[%s]: cycle done — fetched=%d passed_screen=%d deduped=%d mom_rejected=%d sent=%d",
