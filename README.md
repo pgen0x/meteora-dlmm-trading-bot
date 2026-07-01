@@ -3,10 +3,11 @@
 A standalone signal daemon for **Meteora DLMM** liquidity provision on Solana.
 
 It continuously watches Meteora's pool-discovery API, screens pools with the
-same gates a battle-tested DLMM pipeline uses, and forwards each *newly
-qualifying* pool to a [Hermes](https://github.com/NousResearch/hermes) agent
-webhook. Your agent then reviews the signal and decides whether to open a
-concentrated-liquidity position.
+same gates a battle-tested DLMM pipeline uses, and forwards each cycle's *batch*
+of newly-qualifying pools — as one signal — to a
+[Hermes](https://github.com/NousResearch/hermes) agent webhook. Your agent then
+compares the set, picks the single strongest pool and a strategy, and deploys it
+(via `dlmm_pipeline.py --from-signal`, which skips re-screening) — or rejects.
 
 It runs entirely on Meteora's **public pool-discovery API** — no third-party
 accounts, API keys, or scraping required to source signals.
@@ -14,9 +15,9 @@ accounts, API keys, or scraping required to source signals.
 ```
 ┌──────────────────────┐   HMAC-signed    ┌─────────────────────┐
 │ meteora-dlmm-signal  │  POST /webhooks/ │   Hermes agent      │
-│  (this Go daemon)     ├─────────────────▶│  reviews signal,    │
-│                      │   dlmm-signal    │  decides deploy     │
-│ poll ▸ screen ▸ dedup│                  │  ▸ dlmm_pipeline.py │
+│  (this Go daemon)    ├─────────────────▶│  ranks the batch,   │
+│                      │   dlmm-signal    │  picks 1 + strategy │
+│ poll ▸ screen ▸ dedup│  (batch array)   │  ▸ dlmm_pipeline.py │
 └──────────────────────┘                  └─────────────────────┘
          │                                          │
    Meteora discovery API                    Meteora on-chain (deploy/monitor)
@@ -26,8 +27,10 @@ accounts, API keys, or scraping required to source signals.
 
 Blind time-based screening (a cron that scans every 30m) deploys into whatever
 happens to trend at that minute — weak selection. This daemon watches
-*continuously* and fires the instant a pool crosses every quality gate, so the
-agent reviews fresh, qualifying pools instead of stale cron snapshots.
+*continuously* and, each cycle, emits every pool that crosses all quality gates
+as one batch. Sending the whole set (instead of first-come per-pool) lets the
+agent compare candidates and pick the strongest — no mediocre early pool grabs
+a slot the best pool wanted — off fresh data instead of stale cron snapshots.
 
 ## What gets screened
 
