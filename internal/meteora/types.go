@@ -1,0 +1,95 @@
+package meteora
+
+// SolMint is the wrapped-SOL mint. Pools are only considered if one side is SOL.
+const SolMint = "So11111111111111111111111111111111111111112"
+
+// Warning is one base-token risk warning from the discovery API.
+type Warning struct {
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// Token is one side of a pool (token_x or token_y) as returned by the
+// Meteora pool-discovery API. Field names mirror the JSON exactly.
+type Token struct {
+	Address       string    `json:"address"`
+	Symbol        string    `json:"symbol"`
+	OrganicScore  float64   `json:"organic_score"`
+	MarketCap     float64   `json:"market_cap"`
+	Holders       int       `json:"holders"`
+	TopHoldersPct float64   `json:"top_holders_pct"`
+	DevBalancePct float64   `json:"dev_balance_pct"`
+	HasFreezeAuth bool      `json:"has_freeze_authority"`
+	HasMintAuth   bool      `json:"has_mint_authority"`
+	Warnings      []Warning `json:"warnings"`
+
+	// Verified / JupShield fail OPEN: the API omits them for some tokens, so a
+	// nil pointer means "not provided" -> treated as passing (fail-open). The
+	// discovery API's field is `is_verified`; the Python pipeline mapped a
+	// non-existent `verified` key so its verified-gate never actually fired.
+	// Mapping the real field here tightens token selection.
+	Verified *bool `json:"is_verified"`
+
+	// JupShield fields are not returned by the current discovery API, so these
+	// stay nil and fail open. Kept for forward-compat if the API adds them.
+	JupShieldVerified *bool `json:"jupshield_verified"`
+	JupShield         *bool `json:"jup_shield"`
+}
+
+// DlmmParams carries the bin step for a pool.
+type DlmmParams struct {
+	BinStep int `json:"bin_step"`
+}
+
+// Pool is one entry from the discovery API data array.
+type Pool struct {
+	PoolAddress          string     `json:"pool_address"`
+	Name                 string     `json:"name"`
+	TVL                  float64    `json:"tvl"`
+	FeeTVLRatio          float64    `json:"fee_tvl_ratio"`
+	FeeActiveTVLRatio    float64    `json:"fee_active_tvl_ratio"`
+	FeeTVLRatioChangePct float64    `json:"fee_tvl_ratio_change_pct"`
+	Volatility           float64    `json:"volatility"`
+	TokenX               Token      `json:"token_x"`
+	TokenY               Token      `json:"token_y"`
+	DlmmParams           DlmmParams `json:"dlmm_params"`
+}
+
+// discoverResponse is the top-level discovery API envelope.
+type discoverResponse struct {
+	Data []Pool `json:"data"`
+}
+
+// Candidate is a screened, qualifying pool ready to emit as a signal.
+// It flattens the base-token view the agent needs for its review.
+type Candidate struct {
+	Mode                 string  `json:"mode"`
+	Timeframe            string  `json:"timeframe"`
+	Pool                 string  `json:"pool"`
+	Name                 string  `json:"name"`
+	BaseMint             string  `json:"base_mint"`
+	BaseSymbol           string  `json:"base_symbol"`
+	SolIsX               bool    `json:"sol_is_x"`
+	TVL                  float64 `json:"tvl"`
+	FeeTVLRatio          float64 `json:"fee_tvl_ratio"`
+	FeeActiveTVLRatio    float64 `json:"fee_active_tvl_ratio"`
+	FeeTVLRatioChangePct float64 `json:"fee_tvl_ratio_change_pct"`
+	DailyFeeUSD          float64 `json:"daily_fee_usd"`
+	Volatility           float64 `json:"volatility"`
+	BinStep              int     `json:"bin_step"`
+	OrganicScore         float64 `json:"organic_score"`
+	Mcap                 float64 `json:"mcap"`
+	Holders              int     `json:"holders"`
+	TopHoldersPct        float64 `json:"top_holders_pct"`
+	DevBalancePct        float64 `json:"dev_balance_pct"`
+	Score                float64 `json:"score"`
+}
+
+// boolOr dereferences an optional bool, returning def when the pointer is nil
+// (field absent from the API payload -> fail-open).
+func boolOr(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
+}

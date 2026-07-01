@@ -1,0 +1,81 @@
+---
+name: solana-dlmm
+description: |
+  Autonomous Meteora DLMM pool screening and position management.
+  Filters candidates, deploys concentrated liquidity, and tracks ranges.
+trigger:
+  - "solana dlmm"
+  - "meteora dlmm"
+  - "solana lp"
+  - "dlmm portfolio"
+---
+
+# Solana DLMM Liquidity Provision Skill
+
+## Overview
+Automated lifecycle of a Solana Meteora DLMM concentrated liquidity position:
+Screen Pools (Fee/TVL, TVL, Volatility, Base Token Safety Gates) → Deploy Single-Sided SOL LP Position → Monitor Active Bins / PnL → Exit Out-of-Range or SL/TP positions → Account realized yields.
+
+## Scripts Directory
+`__PROFILE__/skills/solana-dlmm/scripts/`
+
+---
+
+## Tools & Commands
+
+### 1. `dlmm_pipeline.py` — Ingestion Pipeline
+**Purpose**: Screens Meteora's pool discovery API and deploys into the best candidate.
+**Command**: `python3 ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_pipeline.py --mode <casual|multiday>`
+
+Two modes with **isolated position budgets** (2 slots each, max 4 total):
+
+**`--mode casual`** (30m timeframe — volume spike plays, hold 2-6h):
+*   TVL >= $5k, Fee/TVL >= 0.3%, Mcap >= $250k, Holders >= 500, Max 2 positions
+
+**`--mode multiday`** (24h timeframe — quality holds, target 24h+):
+*   TVL >= $50k, Fee/TVL >= 1.0%, Mcap >= $1M, Holders >= 1,000, Max 2 positions
+
+**Shared filters (both modes)**:
+*   Organic Score >= 75, Volatility 0–15
+*   Momentum: reject if 5m <= -5% or 1h <= -15%
+*   Downtrend gate: reject if 6h <= -12% or 24h <= -25%
+*   Verified + Jupiter shield (fail-open if API omits field)
+*   Dev balance <= 20%, top-10 holders <= 60%, no freeze/mint authority, no critical warnings
+
+**Flags**: `--analyze-only` (screen only, non-blocking), `--pool <ADDR>`, `--strategy <NAME>`
+
+### 2. `dlmm_monitor.py` — Position Monitor
+**Purpose**: Monitors all open positions in Redis and checks SL/TP or Out-of-Range limits.
+**Command**: `python3 ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_monitor.py`
+**Exits managed**:
+*   Stop-Loss: Price drops >= -25% from entry price.
+*   Take-Profit: Price rises >= +50% from entry price.
+*   Out of Range: Position sits outside active bins for >= 30 minutes.
+*   Thin Liquidity: Live pool liquidity drains below $7k floor (SOUL.md `Min Exit Liquidity`) — exit before the position strands. Re-checked every cycle; fail-open on fetch error.
+*   Note: `--report-only` is strictly read-only — never claims/closes/redeploys (incl. fee_compounding & partial_harvest strategies).
+
+**Close GUARD (overrides all exits above):** NEVER close when `in_range` AND `fee_per_tvl_24h >= 10%` AND no hard rule triggered. Do not discretionarily close an empty-`triggered_rules` position unless `5m <= -3%` OR `break_even_days >= 5`. Hard floor `pnl < -20%` and thin-liquidity always close. (Full policy: SOUL.md §9 "Close GUARD".) The `--override-close` path enforces this in code and refuses a healthy close unless `--force`.
+
+**AI HOLD blocks `--override-close`:** If `ai_hold_active: true` in the report, do NOT call `--override-close` — the code will exit(2) and refuse. Only exceptions: (1) pass `--force` for genuine manual override, or (2) `pnl_pct <= -25%` (hard SL emergency, hold auto-bypassed by code). If conditions worsened to emergency, use `--force` and explain in `--reason`.
+
+**Exit chokepoint:** `dlmm_monitor.py` is the ONLY authorized closer — it sets `DLMM_CLOSE_AUTH` after the GUARD/rules pass. A raw `node dlmm_executor.js close <addr>` is REFUSED (exit 3) unless `--force`/`DRY_RUN`. The gateway agent and the spot fast-monitor must never close DLMM positions directly.
+
+### 3. `dlmm_executor.js` — SDK Transaction Executor
+**Purpose**: Interacts directly with Meteora DLMM program on-chain. Invoked by Python runners. Supports RPC failover rotation.
+**Commands**:
+*   `node ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_executor.js active-bin <pool_address>`
+*   `node ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_executor.js deploy <pool_address> <amount_sol> <bins_below> [bins_above]`
+*   `node ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_executor.js claim <position_address>`
+*   `node ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_executor.js close <position_address>`
+*   `node ~/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/dlmm_executor.js positions`
+
+---
+
+## Redis State Keys
+
+| Key | TTL | Purpose |
+|---|---|---|
+| `sol:dlmm:position:<ADDR>` | 7d | LP Position metadata: pool, pair, base_mint, base_symbol, entry_price, entry_bin, bins_below, bins_above, size_sol, deployed_at, tx_hash, strategy, **mode** (casual\|multiday) |
+| `sol:dlmm:active_positions` | permanent set | All currently active DLMM position addresses |
+| `sol:dlmm:position:<ADDR>:oor_since` | permanent | Timestamp when the position was first detected out of range |
+| `sol:dlmm:pnl:daily:YYYY-MM-DD` | 7d | Realized yields tracker: total_sol, count_exits |

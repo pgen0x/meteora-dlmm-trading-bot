@@ -1,0 +1,14 @@
+# Build artifacts
+/mds
+/meteora-dlmm-signal
+*.exe
+
+# Secrets / local config
+.env
+
+# Go
+/vendor/
+
+# Python bytecode
+__pycache__/
+*.pyc
