@@ -1,5 +1,6 @@
 # meteora-dlmm-signal
 
+[![Version](https://img.shields.io/badge/version-0.1.0-informational)](CHANGELOG.md)
 [![Go Version](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-beta-yellow)](#project-status)
@@ -222,16 +223,15 @@ drop-in production dependency.
 
 ## Contributing
 
-Issues and PRs welcome. Before opening a PR:
+Issues and PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
+setup, commit conventions, and the versioning policy. Keep changes scoped:
+this is a small, single-purpose daemon by design. If you're proposing a new
+screening gate or threshold change, explain the reasoning (what failure mode
+it prevents) in the PR description.
 
-```bash
-go build -o mds .
-go vet ./...
-```
-
-Keep changes scoped — this is a small, single-purpose daemon by design. If
-you're proposing a new screening gate or threshold change, explain the
-reasoning (what failure mode it prevents) in the PR description.
+See [`CHANGELOG.md`](CHANGELOG.md) for release history. This project follows
+[Semantic Versioning](https://semver.org/); the current version is reported
+by `./mds -version`.
 
 ## Security
 
