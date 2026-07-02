@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -16,8 +18,20 @@ import (
 	"github.com/meteora-dlmm-signal/internal/scanner"
 )
 
+// Version follows Semantic Versioning (semver.org). Bump it alongside a
+// CHANGELOG.md entry and a matching `vX.Y.Z` git tag — see CONTRIBUTING.md.
+const Version = "0.1.0"
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("mds " + Version)
+		return
+	}
+
 	log.SetFlags(log.LstdFlags | log.LUTC)
+	log.Printf("meteora-dlmm-signal %s starting", Version)
 	cfg := config.Load()
 
 	ctx, cancel := context.WithCancel(context.Background())
