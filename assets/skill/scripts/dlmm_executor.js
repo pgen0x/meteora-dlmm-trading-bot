@@ -7,10 +7,12 @@ const dotenv = require("dotenv");
 const fs = require("fs");
 const path = require("path");
 
-// Resolved from this file's own location (<profile>/skills/solana-dlmm/scripts/) so the
-// script works whether it's a copy or a symlink into a Hermes profile — no install-time
-// path rewrite needed.
-const PROFILE_DIR = path.dirname(path.dirname(path.dirname(__dirname)));
+// Resolved from the invoked path (process.argv[1]), NOT __dirname — Node always
+// realpaths __dirname/__filename through symlinks, which would resolve to this repo
+// instead of the profile when scripts/ is symlinked into a Hermes profile.
+// process.argv[1] is the literal path the process was launched with, untouched.
+const SCRIPT_DIR = path.dirname(path.isAbsolute(process.argv[1]) ? process.argv[1] : path.resolve(process.argv[1]));
+const PROFILE_DIR = path.dirname(path.dirname(path.dirname(SCRIPT_DIR)));
 
 // Load environment variables
 const profileEnvPath = path.join(PROFILE_DIR, ".env");

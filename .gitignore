@@ -12,3 +12,7 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# npm deps for the solana-dlmm skill (installed at repo level so dlmm_executor.js's
+# require() resolution finds them through the scripts/ symlink into Hermes profiles)
+assets/skill/node_modules/

@@ -44,8 +44,12 @@ else
   echo "   created $SUB_DST"
 fi
 
-echo "→ npm install (Meteora SDK) in skill"
-( cd "$PROFILE/skills/solana-dlmm" && npm install --no-audit --no-fund >/dev/null 2>&1 ) && echo "   ok" || echo "   ⚠ npm install failed — run manually in $PROFILE/skills/solana-dlmm"
+echo "→ npm install (Meteora SDK) in repo"
+# Installed in the repo, not the profile: dlmm_executor.js is reached through the
+# scripts/ symlink, and Node resolves require() against the script's *real* path
+# (it always realpaths symlinks for module resolution) — so node_modules has to live
+# next to the real file, in $REPO/assets/skill, not under the profile.
+( cd "$REPO/assets/skill" && npm install --no-audit --no-fund >/dev/null 2>&1 ) && echo "   ok" || echo "   ⚠ npm install failed — run manually in $REPO/assets/skill"
 
 echo "→ Building Go daemon"
 ( cd "$REPO" && go build -o mds . ) && echo "   built $REPO/mds"
@@ -58,6 +62,8 @@ Next steps:
   1. Create $PROFILE/.env with:
        SOLANA_PUBLIC_KEY=...
        SOLANA_PRIVATE_KEY=...          # base58, used by dlmm_executor.js
+       SOLANA_RPC_URLS=...             # comma-separated, tried in order with failover
+                                        # (defaults to public mainnet-beta RPC if unset)
   2. Edit $SUB_DST:
        - set "secret" (match HERMES_WEBHOOK_SECRET below)
        - set deliver_extra.chat_id to your channel
