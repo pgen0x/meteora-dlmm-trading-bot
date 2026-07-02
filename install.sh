@@ -24,7 +24,61 @@ if [ -e "$PROFILE/skills/solana-dlmm/scripts" ] && [ ! -L "$PROFILE/skills/solan
 fi
 ln -sfn "$REPO/assets/skill/scripts" "$PROFILE/skills/solana-dlmm/scripts"
 cp "$REPO/assets/skill/SKILL.md" "$REPO/assets/skill/package.json" "$PROFILE/skills/solana-dlmm/"
-cp "$REPO/assets/skill/solana-web3-scripts/"*.py "$PROFILE/skills/solana-web3/scripts/"
+
+echo "→ Symlinking DLMM-relevant solana-web3 scripts"
+# Individual file symlinks (not a whole-dir symlink): $PROFILE/skills/solana-web3/scripts
+# also holds other, non-DLMM scripts that live only in the profile.
+for f in "$REPO/assets/skill/solana-web3-scripts/"*.py; do
+  ln -sfn "$f" "$PROFILE/skills/solana-web3/scripts/$(basename "$f")"
+done
+
+echo "→ Merging DLMM section into SOUL.md"
+# Section 9 only — SOUL.md is a large per-profile personality/config document with
+# sections unrelated to DLMM; this replaces/inserts just the "## 9. Meteora DLMM ..."
+# block instead of touching (or symlinking) the whole file, which self_improvement.py's
+# update_soul_section.py also tunes live based on trading performance.
+SOUL_DST="$PROFILE/SOUL.md"
+touch "$SOUL_DST"
+python3 - "$SOUL_DST" "$REPO/assets/hermes/SOUL_dlmm_section.md" <<'PY'
+import re, sys
+dst_path, section_path = sys.argv[1], sys.argv[2]
+section = open(section_path).read().rstrip() + "\n"
+content = open(dst_path).read()
+pattern = re.compile(r"^## 9\..*?(?=^## \d|\Z)", re.DOTALL | re.MULTILINE)
+if pattern.search(content):
+    content = pattern.sub(section, content)
+    print("   replaced existing ## 9. section in SOUL.md")
+else:
+    sep = "\n\n" if content.strip() else ""
+    content = content.rstrip() + sep + "\n" + section
+    print("   appended ## 9. section to SOUL.md")
+open(dst_path, "w").write(content)
+PY
+
+echo "→ Merging DLMM cron jobs (skips any job name that already exists)"
+JOBS_DST="$PROFILE/cron/jobs.json"
+mkdir -p "$(dirname "$JOBS_DST")"
+[ -f "$JOBS_DST" ] || echo "[]" > "$JOBS_DST"
+python3 - "$JOBS_DST" "$REPO/assets/hermes/cron_jobs_template.json" "$PROFILE" <<'PY'
+import json, sys
+dst, src, profile = sys.argv[1], sys.argv[2], sys.argv[3]
+existing = json.load(open(dst))
+if not isinstance(existing, list):
+    existing = existing.get("jobs", [])
+existing_names = {j.get("name") for j in existing}
+template = json.loads(open(src).read().replace("__PROFILE__", profile))
+added = 0
+for job in template:
+    if job["name"] in existing_names:
+        print(f"   skipped (already present): {job['name']}")
+        continue
+    existing.append(job)
+    added += 1
+    print(f"   added: {job['name']} (edit \"deliver\" — it's a placeholder)")
+json.dump(existing, open(dst, "w"), indent=2)
+if added == 0:
+    print("   no new jobs added")
+PY
 
 echo "→ Installing webhook subscription (merges into existing file if present)"
 SUB_SRC="$REPO/assets/hermes/webhook_subscriptions.json"
@@ -68,7 +122,8 @@ Next steps:
        - set "secret" (match HERMES_WEBHOOK_SECRET below)
        - set deliver_extra.chat_id to your channel
   3. Enable the webhook platform in $PROFILE/config.yaml (port 8646).
-  4. Add a cron job to run dlmm_monitor.py every 5m (position management).
+  4. Edit $JOBS_DST — replace the "deliver" placeholder on the two DLMM cron jobs
+     (Position Monitor, Self-Improvement Review) with your channel.
   5. Configure + run the daemon:
        cp $REPO/.env.example $REPO/.env   # edit secret to match step 2
        cd $REPO && set -a && . ./.env && set +a && ./mds
