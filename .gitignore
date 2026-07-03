@@ -1,6 +1,6 @@
 # Build artifacts
-/mds
-/meteora-dlmm-signal
+/mdtb
+/meteora-dlmm-trading-bot
 *.exe
 
 # Secrets / local config

@@ -23,7 +23,7 @@ more correct or more reliable," not "is this a cool feature."
 ```bash
 git clone https://github.com/pgen0x/meteora-dlmm-trading-bot.git
 cd meteora-dlmm-trading-bot
-go build -o mds .
+go build -o mdtb .
 go vet ./...
 ```
 
@@ -58,7 +58,7 @@ This project follows [Semantic Versioning](https://semver.org/)
 - **PATCH** — bug fix, threshold tuning, docs, no behavior contract change.
 
 The current version lives in `main.go` (`const Version`) and is reported via
-`./mds -version`. When your change warrants a release:
+`./mdtb -version`. When your change warrants a release:
 
 1. Bump `Version` in `main.go`.
 2. Add an entry to [`CHANGELOG.md`](CHANGELOG.md) under `[Unreleased]`,

@@ -110,7 +110,7 @@ echo "→ npm install (Meteora SDK) in repo"
 ( cd "$REPO/assets/skill" && npm install --no-audit --no-fund >/dev/null 2>&1 ) && echo "   ok" || echo "   ⚠ npm install failed — run manually in $REPO/assets/skill"
 
 echo "→ Building Go daemon"
-( cd "$REPO" && go build -o mds . ) && echo "   built $REPO/mds"
+( cd "$REPO" && go build -o mdtb . ) && echo "   built $REPO/mdtb"
 
 cat <<DONE
 
@@ -130,5 +130,5 @@ Next steps:
      (Position Monitor, Self-Improvement Review, Journal Reconciliation) with your channel.
   5. Configure + run the daemon:
        cp $REPO/.env.example $REPO/.env   # edit secret to match step 2
-       cd $REPO && set -a && . ./.env && set +a && ./mds
+       cd $REPO && set -a && . ./.env && set +a && ./mdtb
 DONE
