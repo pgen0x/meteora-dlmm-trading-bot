@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A standalone Go daemon (`mds`) that polls Meteora's public DLMM pool-discovery
+A standalone Go daemon (`mdtb`) that polls Meteora's public DLMM pool-discovery
 API, screens pools through quality gates, dedups, and forwards each poll cycle's
 *batch* of newly-qualifying pools as one HMAC-signed webhook to a Hermes agent.
 The agent (logic in `assets/hermes/`) ranks the batch, picks one pool + strategy,
@@ -14,10 +14,10 @@ only** — exits are the `dlmm_monitor.py` cron's job.
 ## Build / run
 
 ```bash
-go build -o mds .              # build the daemon
+go build -o mdtb .              # build the daemon
 go vet ./...                   # vet
 set -a && . ./.env && set +a   # load env (fish: use bass or `env` prefix)
-./mds                          # run (reads config from environment)
+./mdtb                          # run (reads config from environment)
 ./install.sh ~/.hermes/profiles/dlmm   # wire assets into a Hermes profile + build
 ```
 

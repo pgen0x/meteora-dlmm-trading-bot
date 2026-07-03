@@ -75,7 +75,7 @@ accounts, API keys, or scraping required to source signals.
 
 ```
 ┌─────────────────────────┐   HMAC-signed   ┌─────────────────────┐
-│ mds (this Go daemon)    │ POST /webhooks/ │ Hermes agent        │
+│ mdtb (this Go daemon)   │ POST /webhooks/ │ Hermes agent        │
 │                         ├────────────────▶│ ranks the batch,    │
 │                         │   dlmm-signal   │ picks 1 + strategy  │
 │ poll -> screen -> dedup │  (batch array)  │ -> dlmm_pipeline.py │
@@ -142,7 +142,7 @@ git clone https://github.com/pgen0x/meteora-dlmm-trading-bot.git
 cd meteora-dlmm-trading-bot
 
 # Installs the skill (symlinked, not copied — edits here go live instantly),
-# the webhook subscription, SOUL.md section + cron job templates, and builds mds.
+# the webhook subscription, SOUL.md section + cron job templates, and builds mdtb.
 ./install.sh ~/.hermes/profiles/<your-profile>
 ```
 
@@ -167,7 +167,7 @@ cp .env.example .env        # set HERMES_WEBHOOK_SECRET to match the subscriptio
 
 ```bash
 set -a && . ./.env && set +a
-./mds
+./mdtb
 ```
 
 The daemon is stateless except for its dedup set (in-memory by default; point
@@ -264,7 +264,7 @@ it prevents) in the PR description.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for release history. This project follows
 [Semantic Versioning](https://semver.org/); the current version is reported
-by `./mds -version`.
+by `./mdtb -version`.
 
 ## Security
 

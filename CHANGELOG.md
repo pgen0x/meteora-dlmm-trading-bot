@@ -36,7 +36,7 @@ Initial beta release. Everything below was consolidated from pre-release
 development history into this first tagged version.
 
 ### Added
-- Go daemon (`mds`): continuous poll ▸ screen ▸ dedup ▸ forward loop against
+- Go daemon (`mdtb`): continuous poll ▸ screen ▸ dedup ▸ forward loop against
   Meteora's public pool-discovery API.
 - Dual-mode screening: `casual` (30m, volume-spike plays) and `multiday`
   (24h, quality holds), each with independent thresholds and isolated
@@ -59,7 +59,7 @@ development history into this first tagged version.
   self-improvement review) into a Hermes profile, and builds the daemon.
 - `docs/SIGNAL_SCHEMA.md`: the webhook payload contract.
 - `CLAUDE.md`: architecture and convention notes for AI-assisted development.
-- `./mds -version` / `main.Version` for reporting the running build version.
+- `./mdtb -version` / `main.Version` for reporting the running build version.
 
 ### Changed
 - `assets/skill/scripts/` is symlinked into installed profiles instead of
