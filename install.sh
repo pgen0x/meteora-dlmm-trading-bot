@@ -23,7 +23,11 @@ if [ -e "$PROFILE/skills/solana-dlmm/scripts" ] && [ ! -L "$PROFILE/skills/solan
   exit 1
 fi
 ln -sfn "$REPO/assets/skill/scripts" "$PROFILE/skills/solana-dlmm/scripts"
-cp "$REPO/assets/skill/SKILL.md" "$REPO/assets/skill/package.json" "$PROFILE/skills/solana-dlmm/"
+# SKILL.md is symlinked too — it documents the monitor's exit rules, and a stale copy
+# in the profile means the agent reasons from outdated policy. package.json stays a
+# copy (informational only; node resolves modules against the scripts' real path).
+ln -sfn "$REPO/assets/skill/SKILL.md" "$PROFILE/skills/solana-dlmm/SKILL.md"
+cp "$REPO/assets/skill/package.json" "$PROFILE/skills/solana-dlmm/"
 
 echo "→ Symlinking DLMM-relevant solana-web3 scripts"
 # Individual file symlinks (not a whole-dir symlink): $PROFILE/skills/solana-web3/scripts
@@ -122,8 +126,8 @@ Next steps:
        - set "secret" (match HERMES_WEBHOOK_SECRET below)
        - set deliver_extra.chat_id to your channel
   3. Enable the webhook platform in $PROFILE/config.yaml (port 8646).
-  4. Edit $JOBS_DST — replace the "deliver" placeholder on the two DLMM cron jobs
-     (Position Monitor, Self-Improvement Review) with your channel.
+  4. Edit $JOBS_DST — replace the "deliver" placeholder on the three DLMM cron jobs
+     (Position Monitor, Self-Improvement Review, Journal Reconciliation) with your channel.
   5. Configure + run the daemon:
        cp $REPO/.env.example $REPO/.env   # edit secret to match step 2
        cd $REPO && set -a && . ./.env && set +a && ./mds

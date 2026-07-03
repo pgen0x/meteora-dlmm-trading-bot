@@ -102,6 +102,37 @@ the whole batch.
 - A Solana RPC endpoint (Helius, QuickNode, or the public
   `api.mainnet-beta.solana.com` as a fallback) and a funded wallet.
 
+### Create a Hermes profile
+
+If you don't have a Hermes profile yet, create a dedicated one for the trading
+agent (full guide: [Hermes docs — Profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles)):
+
+```bash
+# Create a profile named "dlmm" — this also registers a `dlmm` command alias
+hermes profile create dlmm
+
+# Configure API keys and model settings interactively
+dlmm setup
+
+# Optional config tweaks
+dlmm config set model.default anthropic/claude-sonnet-4
+```
+
+Key files under `~/.hermes/profiles/dlmm/`:
+
+- `.env` — API keys and, for this project, your wallet (`SOLANA_PUBLIC_KEY` /
+  `SOLANA_PRIVATE_KEY`, see [Configuration](#quick-start) below).
+- `config.yaml` — model, platforms, and the webhook port this daemon posts to.
+- `SOUL.md` — the agent's personality/policy document; `install.sh` merges the
+  DLMM trading rules in as section 9.
+
+Start the messaging gateway (Telegram delivery, webhook listener):
+
+```bash
+dlmm gateway start        # foreground
+dlmm gateway install      # or persistent systemd/launchd service
+```
+
 ### Installation
 
 ```bash
