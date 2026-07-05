@@ -57,13 +57,21 @@ This project follows [Semantic Versioning](https://semver.org/)
 - **MINOR** — new screening gate, new mode, new config option, backward-compatible.
 - **PATCH** — bug fix, threshold tuning, docs, no behavior contract change.
 
-The current version lives in `main.go` (`const Version`) and is reported via
+The current version lives in `main.go` (`var Version`) and is reported via
 `./mdtb -version`. When your change warrants a release:
 
 1. Bump `Version` in `main.go`.
 2. Add an entry to [`CHANGELOG.md`](CHANGELOG.md) under `[Unreleased]`,
    moved into a new dated version section.
 3. Tag it: `git tag -a vX.Y.Z -m "vX.Y.Z"` and push the tag.
+
+Pushing the tag triggers the `Release` GitHub Actions workflow
+(`.github/workflows/release.yml`): it verifies the tag matches `Version` in
+`main.go`, then runs [GoReleaser](https://goreleaser.com/) (`.goreleaser.yaml`)
+to cross-compile `mdtb` for Linux/macOS (amd64/arm64) and publish a GitHub
+Release with archives, checksums, and a commit-derived changelog. Release
+binaries get the version injected at link time, so a mismatched `main.go`
+bump fails the workflow rather than shipping a wrong `-version` string.
 
 Day-to-day PRs don't need to bump the version or touch the changelog unless
 you're the one cutting the release — a maintainer will batch that.
