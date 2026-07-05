@@ -20,7 +20,8 @@ import (
 
 // Version follows Semantic Versioning (semver.org). Bump it alongside a
 // CHANGELOG.md entry and a matching `vX.Y.Z` git tag — see CONTRIBUTING.md.
-const Version = "0.1.0"
+// Release builds override it via -ldflags "-X main.Version=..." (GoReleaser).
+var Version = "0.1.0"
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")

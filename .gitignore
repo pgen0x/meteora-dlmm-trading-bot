@@ -2,6 +2,7 @@
 /mdtb
 /meteora-dlmm-trading-bot
 *.exe
+/dist/
 
 # Secrets / local config
 .env
