@@ -102,6 +102,19 @@ type Candidate struct {
 	TopHoldersPct        float64 `json:"top_holders_pct"`
 	DevBalancePct        float64 `json:"dev_balance_pct"`
 	Score                float64 `json:"score"`
+
+	// Degen Score inputs, exposed so the agent sees WHY a score is high/low
+	// instead of trusting an opaque number.
+	ActiveTVL            float64 `json:"active_tvl"`
+	VolumeActiveTVLRatio float64 `json:"volume_active_tvl_ratio"`
+	UniqueLPs            float64 `json:"unique_lps"`
+	PositionsCreated     float64 `json:"positions_created"`
+
+	// Jupiter audit enrichment (audit gate). Pointers + omitempty: absent
+	// means the audit fetch failed or omitted the field (fail-open) — the
+	// agent must treat missing as unknown, not zero.
+	BotHoldersPct *float64 `json:"bot_holders_pct,omitempty"`
+	GlobalFeesSOL *float64 `json:"global_fees_sol,omitempty"`
 }
 
 // boolOr dereferences an optional bool, returning def when the pointer is nil

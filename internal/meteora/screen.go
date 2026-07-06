@@ -250,6 +250,10 @@ func Screen(p Pool, mp ModeParams) (*Candidate, string) {
 		TopHoldersPct:        base.TopHoldersPct,
 		DevBalancePct:        base.DevBalancePct,
 		Score:                score,
+		ActiveTVL:            p.ActiveTVL,
+		VolumeActiveTVLRatio: p.VolumeActiveTVLRatio,
+		UniqueLPs:            p.UniqueLPs,
+		PositionsCreated:     p.PositionsCreated,
 	}, ""
 }
 
