@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.8.0...v1.9.0) (2026-07-08)
+
+
+### Features
+
+* **cron:** 1h-momentum override in position-monitor GUARD ([0c257fe](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/0c257fe9329b4a7da1c74dffd66a2d8a987c8f4c))
+* **monitor:** sustained-downtrend exit rule in the 20s loop ([e205be4](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/e205be40b0f50c55e522ec5d96e7d62629300b50))
+
+
+### Bug Fixes
+
+* **cron:** forbid fee/TVL as HOLD justification for OOR positions ([6f1fdf1](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/6f1fdf17282d7006e000a24efab7aceb375914e8))
+* OOR hold discipline + sustained-downtrend exits ([602da35](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/602da356a606f1a12a3f9428f7301a0ffbb2f466))
+
 ## [1.8.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.7.0...v1.8.0) (2026-07-08)
 
 
