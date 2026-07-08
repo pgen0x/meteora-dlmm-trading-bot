@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.4.0...v1.5.0) (2026-07-08)
+
+
+### Features
+
+* **skill:** extend OOR rebalance to casual and multiday modes ([362cfba](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/362cfbafd4b084045a6770c8646a2636a2cd5be6))
+* **skill:** extend OOR rebalance to casual and multiday modes ([2eb4bae](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/2eb4bae92b7152a6f9f824de3ffe3ab21b9046a7))
+
 ## [1.4.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.3.0...v1.4.0) (2026-07-08)
 
 
