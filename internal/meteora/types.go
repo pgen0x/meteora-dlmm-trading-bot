@@ -126,6 +126,21 @@ type Candidate struct {
 	PriorCloses    *int     `json:"prior_closes,omitempty"`
 	PriorNetPnlSOL *float64 `json:"prior_net_pnl_sol,omitempty"`
 
+	// GMGN holder-quality enrichment (gmgn.go). Advisory only — absent means
+	// the fetch failed, the gate is disabled, or the field was omitted
+	// (fail-open); the agent must treat missing as unknown, not zero.
+	// Smart/KOL counts are bullish conviction; sniper/bundler counts, insider
+	// volume share and a serial-deployer dev are bearish quality flags.
+	GmgnSmartWallets     *int     `json:"gmgn_smart_wallets,omitempty"`
+	GmgnKolWallets       *int     `json:"gmgn_kol_wallets,omitempty"`
+	GmgnSniperWallets    *int     `json:"gmgn_sniper_wallets,omitempty"`
+	GmgnBundlerWallets   *int     `json:"gmgn_bundler_wallets,omitempty"`
+	GmgnRatVolumePct     *float64 `json:"gmgn_rat_volume_pct,omitempty"`
+	GmgnBundlerVolumePct *float64 `json:"gmgn_bundler_volume_pct,omitempty"`
+	GmgnTop10Pct         *float64 `json:"gmgn_top10_pct,omitempty"`
+	GmgnDevStatus        string   `json:"gmgn_dev_status,omitempty"`
+	GmgnDevTokensCreated *int     `json:"gmgn_dev_tokens_created,omitempty"`
+
 	// PVP (same-symbol rival) flag + rival stats (pvp.go). Absent/false means
 	// no established rival found OR the check failed (fail-open) — the flag is
 	// advisory for the agent's pick, never a daemon-side reject.

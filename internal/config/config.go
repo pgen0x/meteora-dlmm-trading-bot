@@ -46,6 +46,14 @@ type Config struct {
 	// candidates. 0 disables the gate.
 	LoneMinScore float64
 
+	// EnableGmgnGate fetches the GMGN token snapshot (smart-money holder
+	// count, insider/bundler volume share, dev track record) for every fresh
+	// candidate and attaches it to the payload. Advisory only — never
+	// rejects. Best-effort, fail-open; requires GmgnAPIKey (empty key
+	// disables the fetch regardless of the toggle).
+	EnableGmgnGate bool
+	GmgnAPIKey     string
+
 	// EnablePVPCheck searches for an established same-symbol rival token with
 	// its own live DLMM pool and flags contested candidates (is_pvp + rival
 	// stats) in the payload. Advisory only — never rejects. Best-effort,
@@ -112,6 +120,8 @@ func Load() Config {
 		EnableTurnover:     getbool("ENABLE_TURNOVER", false), // experimental — see meteora.Turnover
 		EnableMomentumGate: getbool("ENABLE_MOMENTUM_GATE", true),
 		EnableAuditGate:    getbool("ENABLE_AUDIT_GATE", true),
+		EnableGmgnGate:     getbool("ENABLE_GMGN_GATE", true),
+		GmgnAPIKey:         getenv("GMGN_API_KEY", ""),
 		LoneMinScore:       getfloat("LONE_MIN_SCORE", 50),
 		EnablePVPCheck:     getbool("ENABLE_PVP_CHECK", true),
 	}
