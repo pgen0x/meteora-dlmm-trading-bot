@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.10.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.9.0...v1.10.0) (2026-07-09)
+
+
+### Features
+
+* GMGN holder-quality enrichment for signal candidates ([7309540](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/7309540e6f49d88135a8e1b65c1ae6483783b113))
+* GMGN holder-quality enrichment for signal candidates ([e715bb5](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/e715bb531b27f61ae1cff32d389ff270861197fe))
+* mode-scoped dedup window for casual (CASUAL_SEEN_TTL, default 6h) ([fb383c5](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/fb383c55f4dc1eb5801f3f335171d00d2bff0e12))
+* mode-scoped dedup window for casual (CASUAL_SEEN_TTL, default 6h) ([66ba00d](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/66ba00daafecc5d8f5dd939c867e76de851eb9a8))
+
 ## [1.9.0](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.8.0...v1.9.0) (2026-07-09)
 
 
