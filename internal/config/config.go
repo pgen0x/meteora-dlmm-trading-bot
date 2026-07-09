@@ -20,6 +20,10 @@ type Config struct {
 	RedisAddr    string
 	RedisSeenKey string
 	SeenTTL      time.Duration
+	// Turnover dedups on a shorter window: its positions live minutes, not
+	// hours, so a still-qualifying pool must be able to re-signal once the
+	// prior cycle ends (pool/symbol cooldowns still gate fee-dead re-entries).
+	TurnoverSeenTTL time.Duration
 
 	// Screening thresholds per mode are defined in the meteora package;
 	// only the enable toggles live here.
@@ -102,6 +106,7 @@ func Load() Config {
 		RedisAddr:          getenv("REDIS_ADDR", ""),
 		RedisSeenKey:       getenv("REDIS_SEEN_KEY", "dlmm:signal:seen_pools"),
 		SeenTTL:            getdur("SEEN_TTL", 24*time.Hour),
+		TurnoverSeenTTL:    getdur("TURNOVER_SEEN_TTL", 2*time.Hour),
 		EnableCasual:       getbool("ENABLE_CASUAL", true),
 		EnableMultiday:     getbool("ENABLE_MULTIDAY", true),
 		EnableTurnover:     getbool("ENABLE_TURNOVER", false), // experimental — see meteora.Turnover

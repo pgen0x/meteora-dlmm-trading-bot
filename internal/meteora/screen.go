@@ -17,7 +17,7 @@ type ModeParams struct {
 	MinHolders      int     // MIN_HOLDERS
 	MinDailyFee     float64 // absolute daily-fee floor (USD)
 	MinOrganic      float64 // shared MIN_ORGANIC_SCORE
-	MinQuoteOrganic float64 // quote-token organic floor (ported from Meridian)
+	MinQuoteOrganic float64 // quote-token organic floor (ported from the reference config)
 	MinBinStep      int     // DLMM bin-step floor (0 disables the gate)
 	MaxBinStep      int     // DLMM bin-step ceiling (0 disables the gate)
 
@@ -35,7 +35,7 @@ type ModeParams struct {
 }
 
 // Casual and Multiday mirror the two isolated budgets in the pipeline.
-// Bin-step band (80–125) ported from Meridian config; tune per strategy.
+// Bin-step band (80–125) ported from the reference config config; tune per strategy.
 //
 // DIVERGENCE from dlmm_pipeline.py: casual MinFeeTVL is 0.1, not the upstream
 // 0.3. The API's fee_tvl_ratio is scoped to the queried timeframe, so for the
@@ -81,7 +81,7 @@ var (
 )
 
 // Degen Score targets — each liquidity-relative sub-score saturates here.
-// Ported from Meridian; inputs are normalized to a 30m reference window.
+// Ported from the reference config; inputs are normalized to a 30m reference window.
 const (
 	degenRefMinutes      = 30.0
 	degenTargetVolRatio  = 20.0    // (30m) volume/active_tvl for a full trading sub-score
@@ -105,7 +105,7 @@ func Screen(p Pool, mp ModeParams) (*Candidate, string) {
 		return nil, "non-SOL pool"
 	}
 
-	// Authoritative API risk flags (ported from Meridian) — cheaper than parsing
+	// Authoritative API risk flags (ported from the reference config) — cheaper than parsing
 	// the warnings array and caught before any threshold math.
 	if p.HasCriticalWarnings {
 		return nil, "base token critical warnings"
@@ -204,7 +204,7 @@ func Screen(p Pool, mp ModeParams) (*Candidate, string) {
 		}
 	}
 
-	// Bin-step band gate (ported from Meridian). 0 endpoints disable each side.
+	// Bin-step band gate (ported from the reference config). 0 endpoints disable each side.
 	binStep := p.DlmmParams.BinStep
 	if mp.MinBinStep > 0 && binStep < mp.MinBinStep {
 		return nil, fmt.Sprintf("bin_step %d < %d", binStep, mp.MinBinStep)
@@ -273,7 +273,7 @@ func degenScore(p Pool, tfMinutes float64) float64 {
 	tfScale := degenRefMinutes / tfMinutes
 
 	// When the API omits the precomputed ratios, derive them from the raw
-	// window volume/fee (mirrors Meridian). Without this, a missing ratio
+	// window volume/fee (mirrors the reference config). Without this, a missing ratio
 	// zeroes the sub-score, zeroes the whole degen score, and the caller
 	// falls back to the additive score — which silently bypasses the
 	// lone-candidate conviction gate (additive scores sit near 75+).

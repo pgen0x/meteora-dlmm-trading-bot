@@ -15,8 +15,8 @@ import (
 const jupAssetSearchURL = "https://datapi.jup.ag/v1/assets/search"
 
 // Audit gate threshold (screening thresholds live in this package by
-// convention). Bot-holder ceiling ported from Meridian's post-recon hard
-// filter. Meridian also hard-rejects on global fees < 30 SOL ("bundled/scam"),
+// convention). Bot-holder ceiling ported from the reference bot's post-recon hard
+// filter. the reference bot also hard-rejects on global fees < 30 SOL ("bundled/scam"),
 // but Jupiter's `fees` figure runs slightly off the accurate (GMGN) number, so
 // the daemon only SHIPS global_fees_sol in the payload and leaves that reject
 // to the agent prompt, where the value is visible next to the decision.

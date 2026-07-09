@@ -154,9 +154,15 @@ func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
 		}
 
 		// Dedup BEFORE the momentum fetch so we don't hit DexScreener for
-		// pools we've already emitted this window.
+		// pools we've already emitted this window. Turnover uses its own
+		// shorter window: fast-cycle positions live minutes, and the default
+		// TTL silenced still-qualifying pools long after their cycle ended.
 		poolKey := mp.Mode + ":" + cand.Pool
-		fresh, err := s.seen.MarkIfNew(ctx, poolKey)
+		seenTTL := s.cfg.SeenTTL
+		if mp.Mode == "turnover" {
+			seenTTL = s.cfg.TurnoverSeenTTL
+		}
+		fresh, err := s.seen.MarkIfNewTTL(ctx, poolKey, seenTTL)
 		if err != nil {
 			log.Printf("scanner[%s]: seen store error: %v", mp.Mode, err)
 			continue

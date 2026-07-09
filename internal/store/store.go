@@ -33,13 +33,23 @@ func New(addr, key string, ttl time.Duration) *Seen {
 // MarkIfNew atomically records id and reports whether it was newly added
 // (true == first time we've seen it, caller should emit a signal).
 func (s *Seen) MarkIfNew(ctx context.Context, id string) (bool, error) {
+	return s.MarkIfNewTTL(ctx, id, s.ttl)
+}
+
+// MarkIfNewTTL is MarkIfNew with a caller-chosen window — the scanner passes a
+// shorter TTL for turnover mode so a still-qualifying pool re-signals after a
+// fast cycle ends instead of being silenced for the full default window.
+func (s *Seen) MarkIfNewTTL(ctx context.Context, id string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		ttl = s.ttl
+	}
 	if s.rdb != nil {
 		// One key per pool with its own TTL. A Redis SET can only expire as a
 		// whole, so the old SAdd+Expire refreshed the entire set's TTL on every
 		// write — the rolling window never lapsed while the scanner kept polling,
 		// so once-seen pools were deduped forever and never re-signalled.
 		// SetNX gives each pool an independent SEEN_TTL window that actually ages out.
-		ok, err := s.rdb.SetNX(ctx, s.key+":"+id, 1, s.ttl).Result()
+		ok, err := s.rdb.SetNX(ctx, s.key+":"+id, 1, ttl).Result()
 		if err != nil {
 			return false, err
 		}
@@ -49,16 +59,16 @@ func (s *Seen) MarkIfNew(ctx context.Context, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	// Lazy expiry of the in-memory map.
+	// Lazy expiry of the in-memory map (values are expiry deadlines).
 	for k, t := range s.mem {
-		if now.Sub(t) > s.ttl {
+		if now.After(t) {
 			delete(s.mem, k)
 		}
 	}
 	if _, ok := s.mem[id]; ok {
 		return false, nil
 	}
-	s.mem[id] = now
+	s.mem[id] = now.Add(ttl)
 	return true, nil
 }
 

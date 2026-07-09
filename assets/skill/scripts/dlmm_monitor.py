@@ -61,7 +61,7 @@ def get_meteora_portfolio_positions(wallet_address):
 STOP_LOSS_PCT = -25.0
 TAKE_PROFIT_PCT = 50.0
 MAX_OOR_MINUTES = 30
-# Turnover fast-cycle (Meridian-style): an OOR turnover position is idle
+# Turnover fast-cycle: an OOR turnover position is idle
 # fee-capture capital, so it re-centers after minutes — not the multi-hour
 # patience of the thesis modes. The 20s monitor loop makes this cadence real.
 TURNOVER_MAX_OOR_MINUTES = 2
@@ -84,6 +84,12 @@ EMERGENCY_SL_BUFFER_PCT = 3.0
 # Trailing TP must lock at least this much (≈ round-trip swap cost) to count as a
 # take-profit. Below it, a floor breach gets one-tick gap-through grace first.
 TRAILING_MIN_LOCK_PCT = 0.3
+# Sustained-downtrend exit: an underwater position whose token is in a steady 1h
+# decline closes early instead of riding to the SL floor (spurdo: -7.45% at the
+# last cron HOLD, hard SL -17.22% ten minutes later, -21.13% booked after swap
+# slippage). Both thresholds must trip; missing DexScreener data never fires it.
+DOWNTREND_1H_PCT = -5.0
+DOWNTREND_PNL_PCT = -5.0
 
 def send_event_alert(text):
     """Push an event alert straight to the operator via `hermes send` — script-side
@@ -278,9 +284,10 @@ def load_soul_dlmm_params():
 
 
 def get_pool_liquidity_usd(pool, base_mint):
-    """Live pool liquidity (USD) from DexScreener, looked up by pool address (falls
-    back to the base mint's pairs). Returns None on any failure — callers MUST treat
-    None as 'unknown, do not act' (fail-open) so a transient API blip never force-closes."""
+    """Live pool liquidity (USD) and 1h price change (%) from DexScreener, looked up
+    by pool address (falls back to the base mint's pairs). Returns (None, None) on any
+    failure — callers MUST treat None as 'unknown, do not act' (fail-open) so a
+    transient API blip never force-closes."""
     import urllib.request
     urls = [f"https://api.dexscreener.com/latest/dex/pairs/solana/{pool}"]
     if base_mint:
@@ -293,13 +300,18 @@ def get_pool_liquidity_usd(pool, base_mint):
             pairs = data.get("pairs") or ([data["pair"]] if data.get("pair") else [])
             if not pairs:
                 continue
+            match = pairs[0]
             for p in pairs:
                 if (p.get("pairAddress") or "").lower() == pool.lower():
-                    return float((p.get("liquidity") or {}).get("usd") or 0.0)
-            return float((pairs[0].get("liquidity") or {}).get("usd") or 0.0)
+                    match = p
+                    break
+            liq = float((match.get("liquidity") or {}).get("usd") or 0.0)
+            h1_raw = (match.get("priceChange") or {}).get("h1")
+            h1 = float(h1_raw) if h1_raw is not None else None
+            return liq, h1
         except Exception:
             continue
-    return None
+    return None, None
 
 EXECUTOR_PATH = os.path.join(SCRIPT_DIR, "dlmm_executor.js")
 
@@ -893,7 +905,12 @@ def main():
             effective_trigger = max(2.0, min(trailing_trigger_pct, trailing_trigger_pct * (fee_per_tvl_24h / 30.0)))
         else:
             effective_trigger = trailing_trigger_pct
-        if not trailing_active and pnl_pct >= effective_trigger:
+        # Turnover never arms the trailing TP: its income is fee_pct × churn, not
+        # price (screen.go documents "not capped by the monitor's trailing TP").
+        # A TP close sends the pool to cooldown and kills the fast-cycle; instead
+        # the 2m OOR fuse closes into a re-center and the SL/downtrend/thin-liq
+        # rails handle the downside. Peak tracking above stays for reporting.
+        if not trailing_active and pnl_pct >= effective_trigger and meta.get("mode") != "turnover":
             trailing_active = True
             print(f"🔥 Trailing TP activated for {pair}! Trigger {effective_trigger:.1f}% (fee/TVL {fee_per_tvl_24h:.1f}%) reached at {pnl_pct:.2f}% PnL")
             
@@ -993,13 +1010,24 @@ def main():
         # 5b. Exit-side liquidity floor: entry depth gate is not enough — pool liquidity
         # can drain AFTER entry, stranding the position. Re-check live every cycle.
         # fail-open: None (fetch failed) never closes; only a confirmed sub-floor reading does.
-        pool_liquidity_usd = get_pool_liquidity_usd(pool, meta.get("base_mint"))
+        pool_liquidity_usd, price_change_h1 = get_pool_liquidity_usd(pool, meta.get("base_mint"))
         if pool_liquidity_usd is not None:
             print(f"Exit-liquidity check: pool {pair} liquidity = ${pool_liquidity_usd:,.0f} (floor ${min_exit_liquidity_usd:,.0f})")
             if pool_liquidity_usd < min_exit_liquidity_usd and not close_reason:
                 close_reason = f"Thin pool liquidity (${pool_liquidity_usd:,.0f} < ${min_exit_liquidity_usd:,.0f} floor) — exit before it strands"
                 emergency_close = True
                 emergency_reason = close_reason
+
+        # 5c. Sustained-downtrend exit: underwater AND the token has bled >= 5% over
+        # the last hour — fees can't outrun a steady decline, and waiting hands the
+        # exit to the SL floor ~10 points deeper (drooling/spurdo pattern). "dump" in
+        # the reason routes the close through the dump path (2h cooldown, wide swap
+        # impact, no rebalance re-center). Non-emergency: an AI hold can still defer
+        # it, and the emergency SL floor below remains the hard backstop.
+        if (not close_reason and price_change_h1 is not None
+                and price_change_h1 <= DOWNTREND_1H_PCT and pnl_pct <= DOWNTREND_PNL_PCT):
+            close_reason = (f"Sustained downtrend dump (1h {price_change_h1:+.1f}% <= {DOWNTREND_1H_PCT}% "
+                            f"& PnL {pnl_pct:.2f}% <= {DOWNTREND_PNL_PCT}%) — exit before the SL floor")
 
         # An emergency reason must not be diluted by a softer rule that fired after it
         # (pumped-above / OOR / low-yield all overwrite close_reason unconditionally).
@@ -1217,7 +1245,7 @@ def main():
                 cooldown_key = f"sol:dlmm:cooldown:{base_symbol_cd}"
                 loss_streak_key = f"sol:dlmm:loss_streak:{base_symbol_cd}"
 
-                # OOR rebalance (Meridian-style re-center): a position drifting
+                # OOR rebalance (fast-cycle re-center): a position drifting
                 # out of range can be a re-center opportunity instead of an exit,
                 # but only when the drift doesn't contradict the mode's entry
                 # thesis. Turnover pools are picked for fee flow, so re-center in
@@ -1296,7 +1324,7 @@ def main():
                     print(f"🚫 Re-entry cooldown set for {base_symbol_cd}: {cooldown_secs // 3600}h (reason: {'dump/momentum' if is_dump_close else 'normal exit'})")
 
                 # Low-yield exits also cool the POOL itself for 4h (ported from
-                # Meridian's low-yield pool cooldown): the symbol cooldown above
+                # the reference bot's low-yield pool cooldown): the symbol cooldown above
                 # expires in 1h, but a pool whose fee flow already decayed won't
                 # recover that fast — without this we re-enter the same fee-dead
                 # pool on the next signal and churn.

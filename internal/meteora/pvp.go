@@ -13,7 +13,7 @@ import (
 // under one ticker; when an ESTABLISHED rival token (real holders, real fees,
 // its own live DLMM pool) shares the candidate's symbol, the two are fighting
 // for the same liquidity and attention — entering the weaker side is how you
-// end up LPing the loser. Ported from Meridian's enrichPvpRisk.
+// end up LPing the loser. Ported from the reference PVP-risk enrichment.
 //
 // This only FLAGS candidates (is_pvp + rival stats in the payload) so the
 // agent can compare the pick against its rival; it never rejects. Everything
@@ -21,7 +21,7 @@ import (
 const meteoraPoolSearchURL = "https://dlmm.datapi.meteora.ag/pools"
 
 // Rival legitimacy thresholds (screening thresholds live in this package by
-// convention, values ported from Meridian). A "rival" below these is a dust
+// convention, values ported from the reference config). A "rival" below these is a dust
 // copycat, not a war.
 const (
 	pvpRivalLimit       = 2      // strongest same-symbol assets to consider
