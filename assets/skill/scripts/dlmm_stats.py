@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """DLMM fast-cycle scoreboard — the metlex.io/portfolio card for this bot.
 
-Computes the metrics the Meridian screenshots brag about (positions/24h, avg
+Computes the metrics rival bot screenshots brag about (positions/24h, avg
 hold, realized profit, volume churned) plus the ones that actually decide
 whether the fast-cycle rules earn: fees-vs-IL split, win rate, per-mode
 breakdown, and rebalance-chain PnL per pool (the circuit-breaker's view).

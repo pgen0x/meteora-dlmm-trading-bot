@@ -61,7 +61,7 @@ def get_meteora_portfolio_positions(wallet_address):
 STOP_LOSS_PCT = -25.0
 TAKE_PROFIT_PCT = 50.0
 MAX_OOR_MINUTES = 30
-# Turnover fast-cycle (Meridian-style): an OOR turnover position is idle
+# Turnover fast-cycle: an OOR turnover position is idle
 # fee-capture capital, so it re-centers after minutes — not the multi-hour
 # patience of the thesis modes. The 20s monitor loop makes this cadence real.
 TURNOVER_MAX_OOR_MINUTES = 2
@@ -1245,7 +1245,7 @@ def main():
                 cooldown_key = f"sol:dlmm:cooldown:{base_symbol_cd}"
                 loss_streak_key = f"sol:dlmm:loss_streak:{base_symbol_cd}"
 
-                # OOR rebalance (Meridian-style re-center): a position drifting
+                # OOR rebalance (fast-cycle re-center): a position drifting
                 # out of range can be a re-center opportunity instead of an exit,
                 # but only when the drift doesn't contradict the mode's entry
                 # thesis. Turnover pools are picked for fee flow, so re-center in
@@ -1324,7 +1324,7 @@ def main():
                     print(f"🚫 Re-entry cooldown set for {base_symbol_cd}: {cooldown_secs // 3600}h (reason: {'dump/momentum' if is_dump_close else 'normal exit'})")
 
                 # Low-yield exits also cool the POOL itself for 4h (ported from
-                # Meridian's low-yield pool cooldown): the symbol cooldown above
+                # the reference bot's low-yield pool cooldown): the symbol cooldown above
                 # expires in 1h, but a pool whose fee flow already decayed won't
                 # recover that fast — without this we re-enter the same fee-dead
                 # pool on the next signal and churn.

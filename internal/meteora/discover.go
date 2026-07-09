@@ -14,7 +14,7 @@ import (
 var discoverClient = &http.Client{Timeout: 15 * time.Second}
 
 // buildFilters pushes the mode thresholds into the discovery API's filter_by
-// query (ported from Meridian discoverPools) so the API returns pre-filtered
+// query (ported from the reference discovery query) so the API returns pre-filtered
 // pools instead of us discarding junk client-side. Screen still re-checks every
 // gate locally (belt-and-suspenders) since the API filter is best-effort.
 func buildFilters(mp ModeParams) string {

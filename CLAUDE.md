@@ -37,7 +37,7 @@ one pass per enabled mode per `POLL_INTERVAL`.
     thresholds into the API's `filter_by` param (API-side prefilter), but
     `Screen` re-checks **every** gate locally — the API filter is best-effort.
   - `screen.go` — the gate logic and `ModeParams` (`Casual`, `Multiday`). This
-    is a **verbatim port** of the Python `dlmm_pipeline.py` / Meridian config.
+    is a **verbatim port** of the Python `dlmm_pipeline.py` config.
     When changing gates or thresholds, keep them in sync with that upstream, or
     note the divergence — the comments cite where each value came from.
   - `momentum.go` — best-effort DexScreener downtrend gate (fail-open).
