@@ -103,6 +103,11 @@ Every element of `payload` is one candidate pool with these fields:
 | `bot_holders_pct` / `global_fees_sol` | Jupiter audit enrichment (audit gate). **May be absent** — absent means the audit fetch failed (fail-open); treat as unknown, never as zero |
 | `prior_closes` / `prior_net_pnl_sol` | pool memory summary from the monitor's close journal (`sol:dlmm:history:pool:<pool>`, last 10 closes / 30d). **May be absent** — absent means no history (or non-Redis dedup backend), not a clean record. Negative net PnL = this pool cost us before |
 | `is_pvp` + `pvp_rival_name` / `pvp_rival_mint` / `pvp_rival_pool` / `pvp_rival_tvl` / `pvp_rival_holders` / `pvp_rival_fees_sol` | same-symbol rival detection: an established token (≥500 holders, ≥30 SOL fees) sharing this ticker has its own live DLMM pool (≥$5k TVL) — a ticker war. Advisory flag, never a daemon reject. **Absent** = no rival found or check failed (fail-open) |
+| `gmgn_smart_wallets` / `gmgn_kol_wallets` | GMGN holder quality (GMGN gate): count of smart-money wallets (proven profitable traders) and KOL/fund wallets currently holding. Higher = stronger conviction; 0 = nobody notable in yet. **May be absent** — fetch failed or gate disabled (fail-open); treat as unknown, never as zero |
+| `gmgn_sniper_wallets` / `gmgn_bundler_wallets` | count of launch-sniper and bot-bundled-buy wallets holding — bot-farmed supply. High counts relative to `holders` = manufactured demand |
+| `gmgn_rat_volume_pct` / `gmgn_bundler_volume_pct` | share of trade volume from insider ("rat") and bundler wallets, percent. High insider volume = exit liquidity risk |
+| `gmgn_top10_pct` | GMGN's top-10 holder supply share, percent (independent recheck of `top_holders_pct`) |
+| `gmgn_dev_status` / `gmgn_dev_tokens_created` | dev wallet state (`creator_hold` = still holding, `creator_sell` = exited) and how many tokens this creator has launched before — a serial deployer (dozens+) is a rug-factory signal |
 
 To deploy, the agent passes the chosen element's **full JSON record** to
 `dlmm_pipeline.py --from-signal '<record>'`, which skips re-screening (the
