@@ -905,7 +905,12 @@ def main():
             effective_trigger = max(2.0, min(trailing_trigger_pct, trailing_trigger_pct * (fee_per_tvl_24h / 30.0)))
         else:
             effective_trigger = trailing_trigger_pct
-        if not trailing_active and pnl_pct >= effective_trigger:
+        # Turnover never arms the trailing TP: its income is fee_pct × churn, not
+        # price (screen.go documents "not capped by the monitor's trailing TP").
+        # A TP close sends the pool to cooldown and kills the fast-cycle; instead
+        # the 2m OOR fuse closes into a re-center and the SL/downtrend/thin-liq
+        # rails handle the downside. Peak tracking above stays for reporting.
+        if not trailing_active and pnl_pct >= effective_trigger and meta.get("mode") != "turnover":
             trailing_active = True
             print(f"🔥 Trailing TP activated for {pair}! Trigger {effective_trigger:.1f}% (fee/TVL {fee_per_tvl_24h:.1f}%) reached at {pnl_pct:.2f}% PnL")
             
