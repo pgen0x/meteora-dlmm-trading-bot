@@ -5,6 +5,12 @@ every pool that newly qualified that cycle for a single mode — all elements
 share the same `mode`. The agent compares the set, picks the single strongest
 pool, and deploys it (via `dlmm_pipeline.py --from-signal`) — or rejects.
 
+In **direct-deploy mode** (`DEPLOY_CMD` set) the webhook is skipped entirely:
+the daemon hands the same payload array to
+`dlmm_pipeline.py --from-batch '<payload>' --mode <mode>`, which re-ranks the
+batch deterministically and deploys the strongest survivor itself. The payload
+shape is identical in both flows.
+
 ## Transport
 
 - **Method:** `POST`
@@ -112,6 +118,8 @@ Every element of `payload` is one candidate pool with these fields:
 To deploy, the agent passes the chosen element's **full JSON record** to
 `dlmm_pipeline.py --from-signal '<record>'`, which skips re-screening (the
 gates below already ran) and runs only the final live gates before deploy.
+In direct-deploy mode the daemon passes the **whole payload array** to
+`--from-batch` instead and the pipeline does the picking.
 
 ## Screening already applied (agent can trust these)
 

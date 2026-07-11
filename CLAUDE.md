@@ -5,11 +5,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A standalone Go daemon (`mdtb`) that polls Meteora's public DLMM pool-discovery
-API, screens pools through quality gates, dedups, and forwards each poll cycle's
-*batch* of newly-qualifying pools as one HMAC-signed webhook to a Hermes agent.
-The agent (logic in `assets/hermes/`) ranks the batch, picks one pool + strategy,
-and deploys via the skill in `assets/skill/`. This daemon owns **entry signals
-only** — exits are the `dlmm_monitor.py` cron's job.
+API, screens pools through quality gates, dedups, and hands each poll cycle's
+*batch* of newly-qualifying pools to one of two sinks:
+
+- **Webhook mode** (default): one HMAC-signed webhook per batch to a Hermes
+  agent (logic in `assets/hermes/`), which ranks the batch, picks one pool +
+  strategy, and deploys via the skill in `assets/skill/`.
+- **Direct-deploy mode** (`DEPLOY_CMD` set): the daemon runs
+  `dlmm_pipeline.py --from-batch` itself — the pipeline re-ranks the batch
+  deterministically (same heuristics the agent prompt encoded) and deploys the
+  strongest survivor in seconds instead of an LLM agent turn.
+
+This daemon owns **entry signals only** — exits are the `dlmm_monitor.py`
+cron's job.
 
 ## Build / run
 
@@ -21,9 +29,10 @@ set -a && . ./.env && set +a   # load env (fish: use bass or `env` prefix)
 ./install.sh ~/.hermes/profiles/dlmm   # wire assets into a Hermes profile + build
 ```
 
-There are **no Go tests** and no Makefile. All config is environment-driven
-(`internal/config`, defaults in `.env.example`); nothing is hardcoded except the
-screening thresholds.
+Go tests exist only for `internal/deploy` (`go test ./internal/deploy/`);
+there is no Makefile. All config is environment-driven (`internal/config`,
+defaults in `.env.example`); nothing is hardcoded except the screening
+thresholds.
 
 ## Architecture
 
@@ -52,6 +61,11 @@ one pass per enabled mode per `POLL_INTERVAL`.
 - `internal/webhook` — HMAC-SHA256 forwarder. Signature scheme
   (`hex(HMAC-SHA256(secret, body))` in `X-Webhook-Signature`) must match the
   Hermes/gobot side; the shared secret is `HERMES_WEBHOOK_SECRET`.
+- `internal/deploy` — direct-deploy runner: execs `DEPLOY_CMD` with
+  `--from-batch <payload> --mode <mode>` per batch, parses the pipeline's
+  `🚀 DEPLOYED` / `🧪 DRY RUN DEPLOY` stdout markers, and pipes a condensed
+  outcome to `REPORT_CMD` (e.g. `hermes send -t telegram`). Execution failure
+  unmarks the batch for retry; a deterministic REJECT does not.
 - `assets/` — copied into a Hermes profile by `install.sh`, which rewrites the
   literal `__PROFILE__` token to the target path. `assets/skill` = solana-dlmm
   skill (Python pipeline/monitor + JS executor); `assets/hermes` = the webhook

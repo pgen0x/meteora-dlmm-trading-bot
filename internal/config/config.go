@@ -70,6 +70,26 @@ type Config struct {
 	// stats) in the payload. Advisory only — never rejects. Best-effort,
 	// fail-open like the momentum/audit gates.
 	EnablePVPCheck bool
+
+	// DeployCmd switches the daemon to direct-deploy mode: instead of
+	// forwarding each batch to the Hermes agent webhook (LLM pick, observed at
+	// 19-54 min/decision), the daemon runs this command with
+	// `--from-batch <payload JSON> --mode <mode>` appended and the pipeline
+	// picks + deploys deterministically in seconds. Point it at the skill's
+	// pipeline, e.g. `python3 <profile>/skills/solana-dlmm/scripts/dlmm_pipeline.py`.
+	// Empty (default) keeps the webhook flow. Whitespace-split; no spaces in paths.
+	DeployCmd string
+	// DeployTimeout bounds one direct-deploy run (pre-swap + on-chain deploy
+	// can take a couple of minutes on congested RPC).
+	DeployTimeout time.Duration
+	// ReportCmd, when set in direct-deploy mode, receives a short outcome
+	// report on stdin after each run — e.g. `hermes send -t telegram` (no LLM,
+	// reuses the gateway's bot credentials). Empty = log only.
+	ReportCmd string
+	// ReportRejects also delivers REJECT outcomes to ReportCmd. Off by default:
+	// re-signalling modes produce rejects every few cycles and the journal
+	// already logs them; deploys are always reported.
+	ReportRejects bool
 }
 
 func getenv(key, def string) string {
@@ -138,5 +158,9 @@ func Load() Config {
 		GmgnMaxBundlerPct:  getfloat("GMGN_MAX_BUNDLER_PCT", 40),
 		LoneMinScore:       getfloat("LONE_MIN_SCORE", 50),
 		EnablePVPCheck:     getbool("ENABLE_PVP_CHECK", true),
+		DeployCmd:          getenv("DEPLOY_CMD", ""),
+		DeployTimeout:      getdur("DEPLOY_TIMEOUT", 5*time.Minute),
+		ReportCmd:          getenv("REPORT_CMD", ""),
+		ReportRejects:      getbool("REPORT_REJECTS", false),
 	}
 }

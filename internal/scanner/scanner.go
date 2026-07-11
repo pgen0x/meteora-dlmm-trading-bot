@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/meteora-dlmm-trading-bot/internal/config"
+	"github.com/meteora-dlmm-trading-bot/internal/deploy"
 	"github.com/meteora-dlmm-trading-bot/internal/meteora"
 	"github.com/meteora-dlmm-trading-bot/internal/store"
 	"github.com/meteora-dlmm-trading-bot/internal/webhook"
@@ -62,6 +64,7 @@ type Scanner struct {
 	cfg  config.Config
 	seen *store.Seen
 	fwd  *webhook.Forwarder
+	dep  *deploy.Runner
 }
 
 // New wires a Scanner from config.
@@ -70,6 +73,7 @@ func New(cfg config.Config) *Scanner {
 		cfg:  cfg,
 		seen: store.New(cfg.RedisAddr, cfg.RedisSeenKey, cfg.SeenTTL),
 		fwd:  webhook.New(cfg.WebhookURL, cfg.WebhookSecret),
+		dep:  deploy.New(cfg.DeployCmd, cfg.ReportCmd, cfg.DeployTimeout),
 	}
 }
 
@@ -112,6 +116,40 @@ func (s *Scanner) pollAll(ctx context.Context) {
 	for _, mp := range s.modes() {
 		s.pollMode(ctx, mp)
 	}
+}
+
+// directDeploy hands the batch straight to the deterministic picker pipeline
+// (DEPLOY_CMD) instead of the agent webhook, then delivers a short outcome
+// report via REPORT_CMD. Runs synchronously inside the poll loop: deploys are
+// rare relative to poll cycles and serializing them prevents two modes from
+// racing the same wallet balance. Returns the number of candidates handed
+// over (0 on execution failure, which unmarks the batch for retry).
+func (s *Scanner) directDeploy(ctx context.Context, mode string, batch []*meteora.Candidate, batchKeys []string) int {
+	body, err := json.Marshal(batch)
+	if err != nil {
+		log.Printf("scanner[%s]: batch marshal error: %v", mode, err)
+		return 0
+	}
+	out, err := s.dep.Deploy(ctx, body, mode)
+	if err != nil {
+		// Execution failure (timeout, non-zero exit — e.g. failed on-chain
+		// deploy), not a deterministic reject: unmark so the batch retries
+		// next cycle, mirroring the webhook-failure path.
+		for _, k := range batchKeys {
+			s.seen.Unmark(ctx, k)
+		}
+		log.Printf("scanner[%s]: direct deploy failed for batch of %d (will retry): %v\n%s", mode, len(batch), err, out)
+		return 0
+	}
+	deployed := deploy.Deployed(out)
+	summary := deploy.Summarize(out, mode)
+	log.Printf("scanner[%s]: direct deploy done (deployed=%v) for %s\n%s", mode, deployed, batchSummary(batch), summary)
+	if deployed || s.cfg.ReportRejects {
+		if rerr := s.dep.Report(ctx, summary); rerr != nil {
+			log.Printf("scanner[%s]: report delivery failed: %v", mode, rerr)
+		}
+	}
+	return len(batch)
 }
 
 func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
@@ -261,7 +299,9 @@ func (s *Scanner) pollMode(ctx context.Context, mp meteora.ModeParams) {
 
 	sent := 0
 	if len(batch) > 0 {
-		if err := s.fwd.Send("meteora_pool_discovery", batch, time.Now().Unix()); err != nil {
+		if s.dep.Enabled() {
+			sent = s.directDeploy(ctx, mp.Mode, batch, batchKeys)
+		} else if err := s.fwd.Send("meteora_pool_discovery", batch, time.Now().Unix()); err != nil {
 			// Delivery failed — unmark the whole batch so these pools retry on the
 			// next poll instead of being silently dropped for the SEEN_TTL window.
 			for _, k := range batchKeys {

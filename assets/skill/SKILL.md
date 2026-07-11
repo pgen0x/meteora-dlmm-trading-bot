@@ -44,7 +44,15 @@ Two modes with **isolated position budgets** (2 slots each, max 4 total):
 
 **Flags**: `--analyze-only` (screen only, non-blocking), `--pool <ADDR>`, `--strategy <NAME>`
 
-**Entry memory gates (all modes, incl. `--from-signal`)**:
+**Batch mode (`--from-batch '<payload array>' --mode <mode>`)**: consumes the
+mdtb daemon's whole signal batch and replaces the LLM agent's pick step —
+deterministic conviction re-rank (dev-exit / global-fees / PVP hard rejects,
+GMGN boosts+penalties, darwinian signal weights from Redis), strategy chosen
+from the same table the agent prompt used, and runner-up fallback when a live
+gate (bin-array rent, entry timing) rejects the top pick. Used by the daemon's
+`DEPLOY_CMD` direct mode.
+
+**Entry memory gates (all modes, incl. `--from-signal` / `--from-batch`)**:
 *   Symbol cooldown (`sol:dlmm:cooldown:<SYMBOL>`) and pool cooldown (`sol:dlmm:cooldown:pool:<POOL>`) — skip while set.
 *   Pool memory: skip a pool whose journaled closes (`sol:dlmm:history:pool:<POOL>`) show >= 2 past closes netting negative PnL — this pool already cost us.
 *   Repeat-deploy churn guard: the 3rd deploy into the same pool within 24h sets a 12h pool cooldown.
