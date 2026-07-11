@@ -93,6 +93,11 @@ SUSPECT_PNL_RETRY_TTL_SECS = 300
 # Trailing TP must lock at least this much (≈ round-trip swap cost) to count as a
 # take-profit. Below it, a floor breach gets one-tick gap-through grace first.
 TRAILING_MIN_LOCK_PCT = 0.3
+# Fast-out velocity exit: while the trailing TP is armed and the position still
+# holds at least the minimum lock, a 5m dump this steep closes IMMEDIATELY
+# instead of waiting for the ratchet-floor breach — dumps gap through the floor
+# between 20s ticks and turn peaked winners into booked losses.
+FAST_EXIT_M5_PCT = -3.0
 # Sustained-downtrend exit: an underwater position whose token is in a steady 1h
 # decline closes early instead of riding to the SL floor (spurdo: -7.45% at the
 # last cron HOLD, hard SL -17.22% ten minutes later, -21.13% booked after swap
@@ -305,10 +310,10 @@ def load_soul_dlmm_params():
 
 
 def get_pool_liquidity_usd(pool, base_mint):
-    """Live pool liquidity (USD) and 1h price change (%) from DexScreener, looked up
-    by pool address (falls back to the base mint's pairs). Returns (None, None) on any
-    failure — callers MUST treat None as 'unknown, do not act' (fail-open) so a
-    transient API blip never force-closes."""
+    """Live pool liquidity (USD), 1h and 5m price change (%) from DexScreener,
+    looked up by pool address (falls back to the base mint's pairs). Returns
+    (None, None, None) on any failure — callers MUST treat None as 'unknown, do
+    not act' (fail-open) so a transient API blip never force-closes."""
     import urllib.request
     urls = [f"https://api.dexscreener.com/latest/dex/pairs/solana/{pool}"]
     if base_mint:
@@ -327,12 +332,15 @@ def get_pool_liquidity_usd(pool, base_mint):
                     match = p
                     break
             liq = float((match.get("liquidity") or {}).get("usd") or 0.0)
-            h1_raw = (match.get("priceChange") or {}).get("h1")
+            changes = match.get("priceChange") or {}
+            h1_raw = changes.get("h1")
             h1 = float(h1_raw) if h1_raw is not None else None
-            return liq, h1
+            m5_raw = changes.get("m5")
+            m5 = float(m5_raw) if m5_raw is not None else None
+            return liq, h1, m5
         except Exception:
             continue
-    return None, None
+    return None, None, None
 
 EXECUTOR_PATH = os.path.join(SCRIPT_DIR, "dlmm_executor.js")
 
@@ -1063,7 +1071,7 @@ def main():
         # 5b. Exit-side liquidity floor: entry depth gate is not enough — pool liquidity
         # can drain AFTER entry, stranding the position. Re-check live every cycle.
         # fail-open: None (fetch failed) never closes; only a confirmed sub-floor reading does.
-        pool_liquidity_usd, price_change_h1 = get_pool_liquidity_usd(pool, meta.get("base_mint"))
+        pool_liquidity_usd, price_change_h1, price_change_m5 = get_pool_liquidity_usd(pool, meta.get("base_mint"))
         if pool_liquidity_usd is not None:
             print(f"Exit-liquidity check: pool {pair} liquidity = ${pool_liquidity_usd:,.0f} (floor ${min_exit_liquidity_usd:,.0f})")
             if pool_liquidity_usd < min_exit_liquidity_usd and not close_reason:
@@ -1081,6 +1089,19 @@ def main():
                 and price_change_h1 <= DOWNTREND_1H_PCT and pnl_pct <= DOWNTREND_PNL_PCT):
             close_reason = (f"Sustained downtrend dump (1h {price_change_h1:+.1f}% <= {DOWNTREND_1H_PCT}% "
                             f"& PnL {pnl_pct:.2f}% <= {DOWNTREND_PNL_PCT}%) — exit before the SL floor")
+
+        # 5d. Fast-out velocity exit: the trailing ratchet floor is checked once
+        # per tick, so a fast dump gaps THROUGH the floor and a "take-profit"
+        # books a loss (9 of 26 trailing closes peaked >= 2% yet ended <= 0.5%;
+        # Cupsey peaked +5.19%, floor 2.69%, booked -0.72%). When the token is
+        # actively dumping on the 5m candle while the position is armed and
+        # still in profit, realize the profit NOW instead of waiting for the
+        # floor breach. "dump" in the reason routes the 2h cooldown path.
+        # Fail-open: missing m5 never fires.
+        if (not close_reason and trailing_active and price_change_m5 is not None
+                and price_change_m5 <= FAST_EXIT_M5_PCT and pnl_pct >= TRAILING_MIN_LOCK_PCT):
+            close_reason = (f"Fast-out dump exit (5m {price_change_m5:+.1f}% <= {FAST_EXIT_M5_PCT}% "
+                            f"with PnL {pnl_pct:+.2f}%, peak {peak_pnl:+.2f}%) — realizing before floor gap-through")
 
         # An emergency reason must not be diluted by a softer rule that fired after it
         # (pumped-above / OOR / low-yield all overwrite close_reason unconditionally).

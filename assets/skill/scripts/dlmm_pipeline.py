@@ -606,6 +606,28 @@ def select_stage_strategy(deploy_sol, volatility, bin_step, mode=None):
         # flush fills into size instead of the thin tail spot would leave there.
         return ("stage3_wide_bidask", MAX_BINS_BELOW, 0, "bid_ask")
 
+def run_swap_with_retry(cmd, attempts=3):
+    """Run a swap command, retrying only transient failures (Jupiter 429 rate
+    limit, timeouts). Deterministic errors abort immediately, and the on-chain
+    DEPLOY is never retried — only the pre-LP swap, where a reported failure
+    means no swap landed. Lost 3-4 valid deploys to unretried 429/timeouts on
+    2026-07-10/11 alone.
+    """
+    last_res, last_err = None, None
+    for i in range(1, attempts + 1):
+        last_res, last_err = run_command_json(cmd)
+        if last_res and last_res.get("success"):
+            return last_res, None
+        msg = str(last_err or (last_res.get("error") if last_res else "")).lower()
+        if not any(t in msg for t in ("429", "rate limit", "timeout", "timed out")):
+            return last_res, last_err
+        if i < attempts:
+            wait = 3 * i
+            print(f"Swap attempt {i}/{attempts} hit transient error ({msg[:80]}) — retrying in {wait}s")
+            time.sleep(wait)
+    return last_res, last_err
+
+
 def load_signal_weights():
     """Darwinian signal weights learned from the close journal by dlmm_weights.py.
 
@@ -1250,7 +1272,7 @@ def main():
         # Swaps SOL for base token first to deploy token-only Bid-Ask
         print(f"Strategy: single_sided_reseed (token-only Bid-Ask). Swapping {deploy_sol} SOL to base token {winner['base_symbol']} first...")
         swap_cmd = f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {deploy_sol}"
-        swap_res, swap_err = run_command_json(swap_cmd)
+        swap_res, swap_err = run_swap_with_retry(swap_cmd)
         if not swap_res or not swap_res.get("success"):
             print(f"Pre-LP Swap failed: {swap_err or swap_res.get('error') if swap_res else 'No response'}. Aborting deploy.")
             sys.exit(1)
@@ -1357,7 +1379,7 @@ def main():
     if strategy == "balanced_tight":
         half_sol = deploy_sol / 2.0
         print(f"balanced_tight: swapping {half_sol} SOL to {winner['base_symbol']} for the ask side...")
-        swap_res, swap_err = run_command_json(f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {half_sol}")
+        swap_res, swap_err = run_swap_with_retry(f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {half_sol}")
         if not swap_res or not swap_res.get("success"):
             print(f"Pre-LP swap failed: {swap_err or (swap_res.get('error') if swap_res else 'No response')}. Aborting deploy.")
             sys.exit(1)

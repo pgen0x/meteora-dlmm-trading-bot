@@ -66,6 +66,7 @@ gate (bin-array rent, entry timing) rejects the top pick. Used by the daemon's
 *   Take-Profit: Price rises >= +50% from entry price.
 *   Out of Range: Position sits outside active bins for >= 30 minutes.
 *   Thin Liquidity: Live pool liquidity drains below $7k floor (SOUL.md `Min Exit Liquidity`) — exit before the position strands. Re-checked every cycle; fail-open on fetch error.
+*   Fast-out dump exit: trailing TP armed + 5m price change <= -3% + PnL >= +0.3% lock — realize the profit immediately instead of letting the dump gap through the ratchet floor between ticks. Fail-open on missing 5m data.
 *   Trailing TP: activates at SOUL `Trailing TP Trigger`; exit floor is a profit ratchet (peak ≥5% locks +2%, ≥10% locks +6%, ≥20% locks 70% of peak; below that, flat `Trailing TP Drop` from peak).
 *   Emergency SL floor: 3pp below `Hard Stop-Loss` — always closes immediately, bypassing the SL grace, AI holds, and indicator timing. SL grace itself only applies to a young (<15m) in-range position with fee/TVL ≥ 10%.
 *   Note: `--report-only` is read-only — never claims/closes/redeploys (incl. fee_compounding & partial_harvest strategies) — with ONE exception: an emergency close (SL floor breach / thin liquidity) executes even in report-only, because the cron runs report-only and the agent hop adds minutes. Pass `--no-enforce` for pure reporting.
