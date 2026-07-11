@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.11.2](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.11.1...v1.11.2) (2026-07-10)
+
+
+### Bug Fixes
+
+* version badge lost color segment on release-please bump ([f7fae01](https://github.com/pgen0x/meteora-dlmm-trading-bot/commit/f7fae01e9999d44c00372899fd32d6381a0d5996))
+
 ## [1.11.1](https://github.com/pgen0x/meteora-dlmm-trading-bot/compare/v1.11.0...v1.11.1) (2026-07-10)
 
 
