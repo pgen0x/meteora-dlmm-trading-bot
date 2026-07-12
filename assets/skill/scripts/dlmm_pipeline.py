@@ -1313,14 +1313,26 @@ def main():
             
         base_bal = float(bal_data.get("balance", 0))
         # Base token occupies the slot opposite SOL (base is tokenY when sol_is_x).
+        # The range must sit on the base-token side of the price: DLMM bins
+        # above the active bin hold tokenX, bins below hold tokenY. A
+        # token-only deposit into the wrong side lands ZERO liquidity — the
+        # tx succeeds, rent is paid, and the swapped bag strands in the
+        # wallet (2026-07-12 SCAM deploy: bins_below=57/above=0 with X-only
+        # amounts produced an empty position while 27k SCAM sat unhedged).
         if sol_is_x:
+            # Base is tokenY: sell ladder sits BELOW the active bin.
             amount_x = 0
             amount_y = base_bal
+            bins_above = 0
         else:
+            # Base is tokenX: sell ladder sits ABOVE the active bin.
             amount_x = base_bal
             amount_y = 0
+            bins_above = bins_below
+            bins_below = 0
         strategy_type = "bid_ask"
-        print(f"Acquired {base_bal} {winner['base_symbol']}. Ready to deploy token-only Bid-Ask.")
+        print(f"Acquired {base_bal} {winner['base_symbol']}. Ready to deploy token-only Bid-Ask "
+              f"(bins_below: {bins_below}, bins_above: {bins_above}).")
         
     elif strategy == "custom_ratio_spot":
         # Symmetric range: equal bins above and below for balanced in-range time
