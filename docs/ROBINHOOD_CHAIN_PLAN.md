@@ -136,8 +136,31 @@ Strategies: `balanced_tight` (swap half, ±range% band) and `weth_below`
 Wallet: `EVM_PRIVATE_KEY` in profile `.env` accepts a dedicated 0x-hex key OR
 the base58 Solana secret (ed25519 seed reused as secp256k1 scalar) — the
 Solana-derived account is the current setup. Read-only + DRY_RUN paths tested
-live; **remaining**: fund wallet → manual wrap/deploy/close spike at dust
-size → pipeline `--chain` dispatch + monitor exits (Phase 3).
+live. **Wallet funded 2026-07-13**: `0x94098ccD4536729AAEcc113C313E11926A5bec2d`
+(Phantom-exported EVM key, standard BIP44 path — NOT the ed25519-seed-derived
+stopgap account) holds ~0.00104 ETH (gas) + 0.0085 WETH (LP capital), both
+bridged from BNB/SOL via Across/Mayan.
+
+**Automatic dispatch landed** (commit f1504bf, `internal/robinhood/deploy.go`
++ `Scanner.robinhoodDeploy`): mirrors Solana's `DEPLOY_CMD` pattern exactly —
+`ROBINHOOD_DEPLOY_ENABLED=true` makes the daemon pick the batch's
+highest-`Score` candidate and mint it via `uni_executor.js`, bypassing
+OBSERVE/webhook entirely. No re-ranking pipeline needed (screen.go already
+scores every candidate) — picking is a plain argmax. Fails closed on any
+`OpenPositions` read error and enforces `ROBINHOOD_MAX_OPEN_POSITIONS`
+(default 1) before every deploy — **the only safety brake**, since Phase 3
+(monitor/exits) does not exist yet: a deployed position stays open until
+closed by hand via `uni_executor.js close --id N`.
+
+Currently running in production with `ROBINHOOD_DEPLOY_ENABLED=true` +
+profile `DRY_RUN=true` — dispatch triggers on a real qualifying batch but
+mints nothing (paper mode), the safest way to observe the full pick→deploy
+log path end-to-end before spending real WETH. **To go live**: remove/set
+`DRY_RUN=false` in `~/.hermes/profiles/solanza/.env` once a DRY_RUN cycle has
+been observed successfully.
+
+**Remaining**: watch for a live DRY_RUN trigger to confirm the full path;
+Phase 3 monitor exits (trailing TP/SL, fast-out — port the Solana rulebook).
 - `assets/skill/scripts/uni_executor.js` (or `.ts`) — viem +
   `@uniswap/v3-sdk`: wrap ETH→WETH, swap for target token, mint position
   (two-sided `balanced_tight` analog and one-sided above-price reseed),
