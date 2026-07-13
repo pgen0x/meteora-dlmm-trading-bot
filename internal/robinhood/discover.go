@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -25,9 +26,22 @@ const DefaultDiscoverURL = "https://api.geckoterminal.com/api/v2/networks/robinh
 const trendingURL = "https://api.geckoterminal.com/api/v2/networks/robinhood/trending_pools"
 
 // newPoolPages is how many new_pools pages to fetch per cycle (20 pools/page).
-// At the observed ~7 launches/min, 5 pages ≈ 13 minutes of history — deep
-// enough that a pool can clear Fresh.MinAge before scrolling out of reach.
-const newPoolPages = 5
+// At the observed ~7 launches/min, 3 pages ≈ 8 minutes of history — enough
+// for a pool to clear Fresh.MinAge (3m) before scrolling out of reach.
+// Why not more: the keyless GT tier 429s well below its documented 30 req/min
+// (likely per-IP budget shared across this VM's egress) — observed 429s from
+// request ~5 onward regardless of 0.3-1.2s spacing, so the real budget is
+// ~4 req/min. 3 pages + periodic trending stays inside it.
+const newPoolPages = 3
+
+// trendingEvery fetches trending_pools only every Nth cycle: it changes
+// slowly, mostly yields too-old rejects, and each skipped fetch buys budget
+// for the new_pools pages that carry the fresh-band thesis.
+const trendingEvery = 5
+
+// cycleCount tracks FetchNewPools invocations for the trending cadence.
+// Unsynchronized on purpose: the scanner calls this from one goroutine.
+var cycleCount int
 
 var discoverClient = &http.Client{Timeout: 15 * time.Second}
 
@@ -99,20 +113,25 @@ func FetchNewPools(baseURL string) ([]Pool, error) {
 	for page := 1; page <= newPoolPages; page++ {
 		urls = append(urls, fmt.Sprintf("%s?include=base_token%%2Cquote_token&page=%d", baseURL, page))
 	}
-	urls = append(urls, trendingURL+"?include=base_token%2Cquote_token&page=1")
+	if cycleCount%trendingEvery == 0 {
+		urls = append(urls, trendingURL+"?include=base_token%2Cquote_token&page=1")
+	}
+	cycleCount++
 
 	tokens := map[string]gtToken{}
 	var data []gtPool
-	var firstErr error
+	failed := 0
 	for i, u := range urls {
 		gr, err := fetchPage(u)
 		if err != nil {
 			if i == 0 {
 				return nil, err
 			}
-			if firstErr == nil {
-				firstErr = err
-			}
+			// Tolerated (a partial view still yields a usable cycle) but
+			// LOGGED: silent page drops made fetched= swing 63→5 between
+			// cycles and read as launch-velocity noise instead of GT throttling.
+			failed++
+			log.Printf("robinhood: page %d/%d fetch failed (continuing partial): %v", i+1, len(urls), err)
 			continue
 		}
 		data = append(data, gr.Data...)
@@ -123,6 +142,15 @@ func FetchNewPools(baseURL string) ([]Pool, error) {
 				tokens[t.ID] = t
 			}
 		}
+		// Space page requests out: the public tier throttles bursts well
+		// before the documented 30 req/min average (observed: 429s on pages
+		// 5-6 even at 300ms spacing; 1.2s clears a 60s cycle with margin).
+		if i < len(urls)-1 {
+			time.Sleep(1200 * time.Millisecond)
+		}
+	}
+	if failed > 0 {
+		log.Printf("robinhood: %d/%d discovery pages failed this cycle", failed, len(urls))
 	}
 
 	seen := map[string]bool{}
