@@ -10,14 +10,20 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
-set -a
-source "$PROFILE_DIR/.env" 2>/dev/null
-set +a
-
 echo "Starting Robinhood Chain (Uniswap v3) Position Monitor Loop (60s interval)..."
 
 cd "$SCRIPT_DIR" || exit 1
 while true; do
+    # Re-source the profile .env EVERY tick, not once at startup. Sourcing it
+    # outside the loop froze the process env at launch time: a later edit to
+    # DRY_RUN (true -> false) stayed invisible to the running loop, which kept
+    # printing "[dry-run] would close" while a position sat 22 points past its
+    # emergency SL — exits live in the file, dead in the process. A trading loop
+    # must never hold a stale copy of its own kill switch.
+    set -a
+    source "$PROFILE_DIR/.env" 2>/dev/null
+    set +a
+
     python3 "$SCRIPT_DIR/uni_monitor.py"
     sleep 60
 done

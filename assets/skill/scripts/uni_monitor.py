@@ -90,12 +90,24 @@ def save_state(state):
         print(f"warn: could not save monitor state: {e}")
 
 
+# GeckoTerminal 403s the default urllib User-Agent ("Python-urllib/3.x") — the
+# request never reaches the API, fetch_momentum returns (None, None), and the two
+# momentum-driven exits (fast-out, sustained-downtrend) silently never fire,
+# because missing data is treated as passing. Any non-default UA is accepted
+# (Go's default gets 200, which is why the discovery daemon was never affected).
+# Same trap the Jupiter audit gate hit. Do not drop this header.
+USER_AGENT = "mdtb-uni-monitor/1.0"
+
+
 def fetch_momentum(pool):
     """Best-effort GeckoTerminal price-change windows for a pool. Returns
     (m5, h1) percent, or (None, None) — missing data never fires a rule."""
     url = f"https://api.geckoterminal.com/api/v2/networks/robinhood/pools/{pool}"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        })
         with urllib.request.urlopen(req, timeout=10) as resp:
             d = json.load(resp)
         pc = d["data"]["attributes"]["price_change_percentage"]
@@ -175,28 +187,49 @@ def render_card(rows):
     prompt copies it verbatim, so the format lives here, not in the agent turn.
     First line prefix is load-bearing (the cron's OUTPUT RULE keys off it)."""
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    lines = [f"Robinhood LP Status — {ts}"]
+    lines = [f"Robinhood LP Status — {ts}", f"📊 Active Positions: {len(rows)}"]
+    if not rows:
+        lines.append("\nNo active positions. Bot is idle.")
     for r in rows:
-        pool_short = (r["pool"][:6] + "…" + r["pool"][-4:]) if r.get("pool") else "?"
         pnl = f"{r['pnl_pct']:+.1f}%" if r["pnl_pct"] is not None else "n/a"
         val = r["value_weth"]
         ent = r["entry_weth"]
         val_s = f"{val:.5f}" if val is not None else "?"
         ent_s = f"{ent:.5f}" if ent is not None else "?"
-        age = f"{r['age_min']:.0f}m" if r["age_min"] is not None else "n/a"
-        rng = "in-range" if r["in_range"] else f"OUT ({r['oor_min']:.0f}m)"
+        age_min = r["age_min"]
+        if age_min is None:
+            age = "n/a"
+        elif age_min >= 60:
+            age = f"{int(age_min // 60)}h{int(age_min % 60):02d}m"
+        else:
+            age = f"{age_min:.0f}m"
+        rng = "🟢 In Range" if r["in_range"] else f"🔴 OOR {r['oor_min']:.0f}m"
         m5 = f"{r['m5']:+.1f}%" if r["m5"] is not None else "n/a"
         h1 = f"{r['h1']:+.1f}%" if r["h1"] is not None else "n/a"
+        # Only ⚠️ bullets are printed — a healthy position shows just the table
+        # and the summary line, matching the Solana card's compact layout.
+        warnings = []
+        if not r["in_range"]:
+            warnings.append(f"⚠️ Out of range {r['oor_min']:.0f}m (limit {MAX_OOR_MINUTES:.0f}m)")
+        if r["peak_pct"] >= TRAILING_TRIGGER_PCT:
+            warnings.append(f"⚠️ Trailing stop ACTIVE (peak {r['peak_pct']:+.1f}%, floor {trailing_floor_pct(r['peak_pct']):+.1f}%)")
+        if r["m5"] is None or r["h1"] is None:
+            warnings.append("⚠️ No momentum data — fast-out and downtrend exits cannot fire")
         lines += [
             "",
-            f"Position #{r['tokenId']} | {pool_short}",
+            "---",
+            "",
+            f"### Position #{r['tokenId']}",
+            f"`{r['pool']}`" if r.get("pool") else "`?`",
+            "",
             "| Metric | Value |",
             "|--------|-------|",
-            f"| PnL | {pnl} ({val_s} / {ent_s} WETH) |",
-            f"| Peak | {r['peak_pct']:.1f}% |",
-            f"| Range | {rng} |",
-            f"| Age | {age} |",
+            f"| PnL | {pnl} · peak {r['peak_pct']:+.1f}% |",
+            f"| Value | {val_s} / {ent_s} WETH |",
+            f"| Range | {rng} · age {age} |",
             f"| Price 5m/1h | {m5} / {h1} |",
+        ] + [f"- {w}" for w in warnings] + [
+            "",
             f"→ {r['decision']}: {r['reason']}",
         ]
     return "\n".join(lines)
