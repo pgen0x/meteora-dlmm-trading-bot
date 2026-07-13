@@ -606,6 +606,178 @@ def select_stage_strategy(deploy_sol, volatility, bin_step, mode=None):
         # flush fills into size instead of the thin tail spot would leave there.
         return ("stage3_wide_bidask", MAX_BINS_BELOW, 0, "bid_ask")
 
+def run_swap_with_retry(cmd, attempts=3):
+    """Run a swap command, retrying only transient failures (Jupiter 429 rate
+    limit, timeouts). Deterministic errors abort immediately, and the on-chain
+    DEPLOY is never retried — only the pre-LP swap, where a reported failure
+    means no swap landed. Lost 3-4 valid deploys to unretried 429/timeouts on
+    2026-07-10/11 alone.
+    """
+    last_res, last_err = None, None
+    for i in range(1, attempts + 1):
+        last_res, last_err = run_command_json(cmd)
+        if last_res and last_res.get("success"):
+            return last_res, None
+        msg = str(last_err or (last_res.get("error") if last_res else "")).lower()
+        if not any(t in msg for t in ("429", "rate limit", "timeout", "timed out")):
+            return last_res, last_err
+        if i < attempts:
+            wait = 3 * i
+            print(f"Swap attempt {i}/{attempts} hit transient error ({msg[:80]}) — retrying in {wait}s")
+            time.sleep(wait)
+    return last_res, last_err
+
+
+def load_signal_weights():
+    """Darwinian signal weights learned from the close journal by dlmm_weights.py.
+
+    Returns {signal_name: weight} (weights in [0.3, 2.5], 1.0 = neutral) or {}
+    when the Redis key is unset/unparseable. Fail-open: ranking works without it.
+    """
+    out, _, code = run_command("redis-cli get sol:dlmm:signal_weights")
+    if code != 0 or not out or out == "(nil)":
+        return {}
+    try:
+        weights = json.loads(out)
+        return weights if isinstance(weights, dict) else {}
+    except (ValueError, json.JSONDecodeError):
+        return {}
+
+
+# Signals where a higher value should score higher (mirrors dlmm_weights.py).
+# Non-directional signals (volatility, mcap, ...) are skipped here: without a
+# learned direction, rewarding either extreme deterministically would be noise.
+WEIGHTED_SIGNALS_HIGHER_IS_BETTER = (
+    "score", "organic_score", "fee_tvl_ratio", "fee_active_tvl_ratio",
+    "holders", "volume_tvl_ratio", "unique_traders", "global_fees_sol",
+)
+
+
+def apply_batch_conviction(candidates):
+    """Deterministic port of the deploy agent's STEP 3 pick heuristics.
+
+    Hard-rejects candidates the agent always rejected (dev exited, near-zero
+    global fees, contested ticker without dominant conviction), then adjusts
+    each survivor's score with the same boosts/penalties the agent prompt
+    applied qualitatively, plus the darwinian signal weights when present.
+    Mutates candidate["score"] and returns the surviving list; every drop and
+    adjustment is printed so the pick narrative stays auditable.
+    """
+    survivors = []
+    for c in candidates:
+        # Dev wallet exited — the strongest single rug precursor we track.
+        dev_status = c.get("gmgn_dev_status")
+        if dev_status in ("creator_sell", "creator_close"):
+            print(f"Batch reject {c['name']} - dev exited (gmgn_dev_status: {dev_status})")
+            continue
+        # Token has produced almost no swap fees globally = bundled/inorganic.
+        # Absent field = unknown (fail-open), never treated as zero.
+        gf = c.get("global_fees_sol")
+        if gf is not None and float(gf) < 30:
+            print(f"Batch reject {c['name']} - global fees {float(gf):.1f} SOL < 30 (bundled/scam pattern)")
+            continue
+        # Ticker war: the copycat side usually loses. Only a high-conviction
+        # candidate may fight an established rival for its symbol.
+        if c.get("is_pvp") and float(c.get("score", 0)) < 60:
+            print(f"Batch reject {c['name']} - PVP contested ticker with score {float(c.get('score', 0)):.1f} < 60")
+            continue
+        survivors.append(c)
+
+    if not survivors:
+        return survivors
+
+    weights = load_signal_weights()
+    for c in survivors:
+        adj = 0.0
+        notes = []
+
+        # GMGN smart-money boosts: proven wallets holding is the strongest
+        # tie-breaker between otherwise similar candidates.
+        if float(c.get("gmgn_smart_wallets") or 0) >= 3:
+            adj += 10; notes.append("smart+10")
+        if float(c.get("gmgn_kol_wallets") or 0) >= 2:
+            adj += 5; notes.append("kol+5")
+
+        # Manufactured-demand penalties.
+        if float(c.get("gmgn_rat_volume_pct") or 0) > 10:
+            adj -= 15; notes.append("rat-15")
+        if float(c.get("gmgn_bundler_volume_pct") or 0) > 30:
+            adj -= 15; notes.append("bundler-15")
+        if float(c.get("gmgn_dev_tokens_created") or 0) > 20:
+            adj -= 10; notes.append("serial_dev-10")
+
+        # Quality penalties from the agent prompt.
+        if float(c.get("mcap") or 0) > 5_000_000:
+            adj -= 15; notes.append("mcap>5M-15")
+        if float(c.get("bot_holders_pct") or 0) > 20:
+            adj -= 15; notes.append("bots-15")
+        prior_pnl = c.get("prior_net_pnl_sol")
+        if prior_pnl is not None and float(prior_pnl) < 0:
+            adj -= 20; notes.append("prior_loss-20")
+        # Surviving PVP candidates (score >= 60) still yield to a clean pick.
+        if c.get("is_pvp"):
+            adj -= 10; notes.append("pvp-10")
+
+        c["_conviction_adj"] = adj
+        c["_conviction_notes"] = notes
+
+    # Darwinian weights: reward candidates that lead the batch on signals the
+    # close journal says predict winners. Rank-normalized within the batch so
+    # a weight tunes ordering without dwarfing the base score; total influence
+    # clamped to +/-15 like the largest single heuristic above.
+    if weights and len(survivors) > 1:
+        weight_adj = {id(c): 0.0 for c in survivors}
+        for sig in WEIGHTED_SIGNALS_HIGHER_IS_BETTER:
+            w = float(weights.get(sig, 1.0))
+            if abs(w - 1.0) < 0.05:
+                continue
+            present = [c for c in survivors if c.get(sig) is not None]
+            if len(present) < 2:
+                continue
+            ranked = sorted(present, key=lambda c: float(c[sig]))
+            denom = len(ranked) - 1
+            for i, c in enumerate(ranked):
+                weight_adj[id(c)] += (w - 1.0) * (i / denom) * 10
+        for c in survivors:
+            wa = max(-15.0, min(15.0, weight_adj[id(c)]))
+            if wa:
+                c["_conviction_adj"] += wa
+                c["_conviction_notes"].append(f"weights{wa:+.1f}")
+
+    for c in survivors:
+        adj = c.get("_conviction_adj", 0.0)
+        if adj:
+            c["score"] = float(c.get("score", 0)) + adj
+            print(f"Batch conviction {c['name']}: {adj:+.1f} ({', '.join(c.get('_conviction_notes', [])) or 'weights'}) -> score {c['score']:.1f}")
+    return survivors
+
+
+def select_batch_strategy(c, mode):
+    """Deterministic port of the deploy agent's strategy table (STEP 3).
+
+    Thresholds compare the raw signal fields exactly as the agent prompt did
+    (fee_tvl_ratio stays window-scoped for 30m modes). Returns None when no
+    rule matches so the caller falls back to the SOUL.md default, which
+    handles the out-of-band volatility cases (stage_aware/spot).
+    """
+    organic = float(c.get("organic_score") or 0)
+    mcap = float(c.get("mcap") or 0)
+    fee_tvl = float(c.get("fee_tvl_ratio") or 0)
+    vol = float(c.get("volatility") or 0)
+    if mode == "turnover":
+        # Fee-capture thesis: tight two-sided range, ranked by turnover not price.
+        return "balanced_tight"
+    if organic > 85 and mcap < 2_000_000 and fee_tvl > 15:
+        return "single_sided_reseed"
+    if vol < 2 and fee_tvl > 8 and mcap > 2_000_000:
+        return "fee_compounding"
+    if 1.5 <= vol <= 8:
+        # Default for meme pools: both sides earn fees and pumps realize
+        # profit bin-by-bin into SOL.
+        return "balanced_tight"
+    return None
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -613,6 +785,7 @@ def main():
     parser.add_argument("--strategy", type=str, default=None, help="Override SOUL.md strategy (spot, custom_ratio_spot, balanced_tight, single_sided_reseed, fee_compounding, partial_harvest)")
     parser.add_argument("--pool", type=str, default=None, help="Deploy a specific pool address instead of auto-selecting winner")
     parser.add_argument("--from-signal", dest="from_signal", type=str, default=None, help="JSON of a pre-screened candidate record from the mdtb signal daemon. Skips discovery+screen and deploys this exact pool; live gates (holding/cooldown/momentum/rent) still run.")
+    parser.add_argument("--from-batch", dest="from_batch", type=str, default=None, help="JSON ARRAY of pre-screened candidate records (the full mdtb signal payload). Deterministically re-ranks the batch (GMGN/PVP/prior-PnL heuristics + darwinian signal weights), then deploys the strongest candidate that clears every live gate — falling back to the runner-up when a gate rejects the pick. Replaces the LLM agent's pick step.")
     parser.add_argument("--mode", type=str, default="multiday", choices=["casual", "multiday", "turnover"], help="Pipeline mode: casual (30m, 2-6h plays), multiday (24h, 24h+ holds) or turnover (30m, high-fee fee-capture plays)")
     cli = parser.parse_args()
 
@@ -660,7 +833,39 @@ def main():
         sys.exit(0)
 
     # 2. Fetch candidates
-    if cli.from_signal:
+    batch_mode = bool(cli.from_batch)
+    if cli.from_batch:
+        # Deterministic picker: the daemon hands over its ENTIRE poll-cycle
+        # batch and this pipeline replaces the LLM agent's compare-and-pick
+        # step. Records were already screened + enriched daemon-side; here they
+        # are conviction-ranked, then run through the same live gates as any
+        # other candidate, with runner-up fallback when a gate kills the pick.
+        try:
+            batch_records = json.loads(cli.from_batch)
+        except Exception as e:
+            print(f"Aborting: --from-batch is not valid JSON: {e}")
+            sys.exit(1)
+        if not isinstance(batch_records, list) or not batch_records:
+            print("Aborting: --from-batch expects a non-empty JSON array (the signal payload)")
+            sys.exit(1)
+        required = ("pool", "name", "base_mint", "base_symbol", "tvl", "volatility", "score")
+        candidates = []
+        for rec in batch_records:
+            missing = [k for k in required if not isinstance(rec, dict) or k not in rec]
+            if missing:
+                print(f"Skipping malformed batch record ({rec.get('name', '?') if isinstance(rec, dict) else '?'}): missing {', '.join(missing)}")
+                continue
+            candidates.append(rec)
+        if not candidates:
+            print("Aborting: no valid records in --from-batch payload (see docs/SIGNAL_SCHEMA.md)")
+            sys.exit(1)
+        print(f"Batch mode: {len(candidates)} signalled candidate(s) — discovery/screen skipped")
+        candidates = apply_batch_conviction(candidates)
+        if not candidates:
+            print("No candidates survived batch conviction gates.")
+            sys.exit(0)
+        pools = []
+    elif cli.from_signal:
         # mdtb signal daemon already discovered + screened this pool; deploy the
         # forwarded record directly. Skipping our own discovery/screen removes the
         # divergence between two independent trending snapshots that used to cause
@@ -986,6 +1191,9 @@ def main():
     else:
         # Auto-pick: take the highest-scored candidate that is deployable rent-free.
         # Skip any whose range needs new bin-array init (non-refundable). Fail OPEN.
+        # In batch mode the entry-timing indicator runs INSIDE this loop so a
+        # timing-rejected pick falls back to the runner-up instead of wasting
+        # the whole batch (the agent flow only ever checked its single pick).
         winner = None
         for c in valid_candidates:
             v = c["volatility"]
@@ -998,14 +1206,26 @@ def main():
                 print(f"Skipping {c['name']} - deploy range needs {cov.get('missing', 0)} new bin-array init "
                       f"(~{cov.get('totalFee', 0):.4f} SOL non-refundable rent)")
                 continue
+            if batch_mode and params.get("INDICATORS_ENABLED"):
+                preset = params.get("INDICATORS_PRESET", "supertrend_or_rsi")
+                confirmed = check_local_indicators(c["pool"], c["base_mint"], "entry", preset, timeframe)
+                if confirmed is False:
+                    print(f"Skipping {c['name']} - entry timing check ({preset}) rejected for base token {c['base_symbol']}")
+                    continue
+                elif confirmed is None:
+                    print(f"Entry timing: indicator data unavailable for {c['base_symbol']} — proceeding on other gates (fail-open).")
             winner = c
             break
         if not winner:
-            print("No candidates deployable without new bin-array init (all ranges would incur non-refundable rent).")
+            print("No candidates deployable (bin-array rent / entry timing rejected every candidate).")
             sys.exit(0)
 
-    # 5. Indicators Check
-    if params.get("INDICATORS_ENABLED"):
+    if batch_mode:
+        others = ", ".join(c["base_symbol"] for c in valid_candidates if c is not winner) or "none"
+        print(f"BATCH_PICK: {winner['base_symbol']} (score {winner['score']:.1f}) over [{others}]")
+
+    # 5. Indicators Check (batch mode already ran this inside the pick loop)
+    if params.get("INDICATORS_ENABLED") and not batch_mode:
         preset = params.get("INDICATORS_PRESET", "supertrend_or_rsi")
         confirmed = check_local_indicators(winner["pool"], winner["base_mint"], "entry", preset, timeframe)
         if confirmed is False:
@@ -1026,7 +1246,15 @@ def main():
     bins_linear = int(MIN_BINS_BELOW + (vol / 5.0) * (MAX_BINS_BELOW - MIN_BINS_BELOW))
     bins_below = max(MIN_BINS_BELOW, min(MAX_BINS_BELOW, max(bins_physics, bins_linear // 2)))
 
-    strategy = cli.strategy if cli.strategy else params.get("STRATEGY", "spot")
+    strategy = cli.strategy
+    if not strategy and batch_mode:
+        # The agent used to choose the strategy per pick; in batch mode the
+        # deterministic table takes that role, with SOUL.md as the fallback.
+        strategy = select_batch_strategy(winner, mode)
+        if strategy:
+            print(f"Batch strategy: {strategy} (deterministic pick table)")
+    if not strategy:
+        strategy = params.get("STRATEGY", "spot")
     slippage_bps = params.get("SLIPPAGE_BPS", 1000)
     
     # SOL goes in the slot matching pool orientation (executor: amountX->tokenX).
@@ -1044,7 +1272,7 @@ def main():
         # Swaps SOL for base token first to deploy token-only Bid-Ask
         print(f"Strategy: single_sided_reseed (token-only Bid-Ask). Swapping {deploy_sol} SOL to base token {winner['base_symbol']} first...")
         swap_cmd = f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {deploy_sol}"
-        swap_res, swap_err = run_command_json(swap_cmd)
+        swap_res, swap_err = run_swap_with_retry(swap_cmd)
         if not swap_res or not swap_res.get("success"):
             print(f"Pre-LP Swap failed: {swap_err or swap_res.get('error') if swap_res else 'No response'}. Aborting deploy.")
             sys.exit(1)
@@ -1151,7 +1379,7 @@ def main():
     if strategy == "balanced_tight":
         half_sol = deploy_sol / 2.0
         print(f"balanced_tight: swapping {half_sol} SOL to {winner['base_symbol']} for the ask side...")
-        swap_res, swap_err = run_command_json(f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {half_sol}")
+        swap_res, swap_err = run_swap_with_retry(f"node {EXECUTOR_PATH} swap SOL {winner['base_mint']} {half_sol}")
         if not swap_res or not swap_res.get("success"):
             print(f"Pre-LP swap failed: {swap_err or (swap_res.get('error') if swap_res else 'No response')}. Aborting deploy.")
             sys.exit(1)

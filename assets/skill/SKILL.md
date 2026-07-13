@@ -44,7 +44,15 @@ Two modes with **isolated position budgets** (2 slots each, max 4 total):
 
 **Flags**: `--analyze-only` (screen only, non-blocking), `--pool <ADDR>`, `--strategy <NAME>`
 
-**Entry memory gates (all modes, incl. `--from-signal`)**:
+**Batch mode (`--from-batch '<payload array>' --mode <mode>`)**: consumes the
+mdtb daemon's whole signal batch and replaces the LLM agent's pick step —
+deterministic conviction re-rank (dev-exit / global-fees / PVP hard rejects,
+GMGN boosts+penalties, darwinian signal weights from Redis), strategy chosen
+from the same table the agent prompt used, and runner-up fallback when a live
+gate (bin-array rent, entry timing) rejects the top pick. Used by the daemon's
+`DEPLOY_CMD` direct mode.
+
+**Entry memory gates (all modes, incl. `--from-signal` / `--from-batch`)**:
 *   Symbol cooldown (`sol:dlmm:cooldown:<SYMBOL>`) and pool cooldown (`sol:dlmm:cooldown:pool:<POOL>`) — skip while set.
 *   Pool memory: skip a pool whose journaled closes (`sol:dlmm:history:pool:<POOL>`) show >= 2 past closes netting negative PnL — this pool already cost us.
 *   Repeat-deploy churn guard: the 3rd deploy into the same pool within 24h sets a 12h pool cooldown.
@@ -58,6 +66,7 @@ Two modes with **isolated position budgets** (2 slots each, max 4 total):
 *   Take-Profit: Price rises >= +50% from entry price.
 *   Out of Range: Position sits outside active bins for >= 30 minutes.
 *   Thin Liquidity: Live pool liquidity drains below $7k floor (SOUL.md `Min Exit Liquidity`) — exit before the position strands. Re-checked every cycle; fail-open on fetch error.
+*   Fast-out dump exit: trailing TP armed + 5m price change <= -3% + PnL >= +0.3% lock — realize the profit immediately instead of letting the dump gap through the ratchet floor between ticks. Fail-open on missing 5m data.
 *   Trailing TP: activates at SOUL `Trailing TP Trigger`; exit floor is a profit ratchet (peak ≥5% locks +2%, ≥10% locks +6%, ≥20% locks 70% of peak; below that, flat `Trailing TP Drop` from peak).
 *   Emergency SL floor: 3pp below `Hard Stop-Loss` — always closes immediately, bypassing the SL grace, AI holds, and indicator timing. SL grace itself only applies to a young (<15m) in-range position with fee/TVL ≥ 10%.
 *   Note: `--report-only` is read-only — never claims/closes/redeploys (incl. fee_compounding & partial_harvest strategies) — with ONE exception: an emergency close (SL floor breach / thin liquidity) executes even in report-only, because the cron runs report-only and the agent hop adds minutes. Pass `--no-enforce` for pure reporting.
