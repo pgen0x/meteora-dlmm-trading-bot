@@ -186,12 +186,19 @@ EVM executor lands (docs/ROBINHOOD_CHAIN_PLAN.md Phase 2).
   "gmgn_rat_volume_pct": 0,
   "gmgn_bundler_volume_pct": 27.98,
   "gmgn_top10_pct": 17.3,
-  "gmgn_dev_status": "creator_close"
+  "gmgn_dev_status": "creator_close",
+  "is_copycat": true,
+  "copycat_count": 2
 }
 ```
 
 Field notes:
 
+- `is_copycat` / `copycat_count` — set only when two or more candidates in the
+  SAME batch share a ticker (both fields omitted otherwise). Advisory, like the
+  Solana venue's `is_pvp`: it never rejects, but the autonomous picker demotes
+  copycats below any clean candidate. Detection is intra-batch (same-cycle);
+  cross-cycle same-symbol launches aren't correlated.
 - `fee_tvl_day_pct` — projected daily fee/TVL %, computed as
   `volume_h1 x 24 x fee_pct / reserve` (GeckoTerminal exposes no fee field;
   v3 fees are deterministic).

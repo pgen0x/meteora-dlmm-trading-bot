@@ -179,4 +179,13 @@ type Candidate struct {
 	GmgnBundlerVolumePct *float64 `json:"gmgn_bundler_volume_pct,omitempty"`
 	GmgnTop10Pct         *float64 `json:"gmgn_top10_pct,omitempty"`
 	GmgnDevStatus        string   `json:"gmgn_dev_status,omitempty"`
+
+	// Copycat (same-symbol collision) flag — set by EnrichCopycat when more than
+	// one candidate in the SAME batch shares this ticker (the observed "2× CALLIE
+	// in one cycle" quirk: meme launches spawn imposters under a hot ticker,
+	// splitting liquidity/attention). Advisory like the Solana venue's is_pvp —
+	// never rejects — but the autonomous picker demotes copycats below any clean
+	// candidate. CopycatCount is the size of the colliding group (>= 2).
+	IsCopycat    bool `json:"is_copycat,omitempty"`
+	CopycatCount int  `json:"copycat_count,omitempty"`
 }

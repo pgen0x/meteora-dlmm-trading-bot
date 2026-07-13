@@ -124,8 +124,12 @@ diverge too much for a common `Discover()` signature to earn its keep.
   tri-state). Live smoke 2026-07-13: 61 fetched → 3 passed, fully enriched
   (holders, taxes, bundler %); rejects `reserve=50 fee_tier=5 too-young=3`.
 - **Next**: run observe-only ≥3 days, calibrate `Fresh` thresholds from the
-  journaled batches. Observed quirk to watch: copycat same-symbol launches
-  (two CALLIE pools in one cycle) — the venue may need a PVP-style flag.
+  journaled batches. Copycat same-symbol
+  launches (two CALLIE pools in one cycle) now flagged: `copycat.go`
+  `EnrichCopycat` sets `is_copycat`/`copycat_count` on intra-batch ticker
+  collisions (advisory, EVM analog of Solana `pvp.go`), and the picker
+  (`pickBest`) demotes copycats below any clean candidate. Same-cycle only;
+  cross-cycle correlation would need persistent symbol memory (not built).
 
 ### Phase 2 — executor: deploy path (executor ✅ 2026-07-13; live spike + dispatch pending)
 Landed: `assets/skill/scripts/uni_executor.js` (viem-only, no @uniswap SDKs).

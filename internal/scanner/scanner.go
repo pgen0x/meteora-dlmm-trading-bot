@@ -143,12 +143,34 @@ func rhBatchSummary(batch []*robinhood.Candidate) string {
 // pick is a plain argmax. Fails closed on any OpenPositions read error: with
 // no monitor yet to close stale positions, an unknown count must never be
 // treated as "room to deploy".
-func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*robinhood.Candidate) {
-	best := batch[0]
-	for _, c := range batch[1:] {
-		if c.Score > best.Score {
+// pickBest returns the highest-scoring candidate, preferring non-copycats: it
+// takes the argmax over clean candidates if any exist, otherwise the argmax
+// over the whole (all-copycat) batch. Batch is non-empty by caller contract.
+func pickBest(batch []*robinhood.Candidate) *robinhood.Candidate {
+	var best, bestClean *robinhood.Candidate
+	for _, c := range batch {
+		if best == nil || c.Score > best.Score {
 			best = c
 		}
+		if !c.IsCopycat && (bestClean == nil || c.Score > bestClean.Score) {
+			bestClean = c
+		}
+	}
+	if bestClean != nil {
+		return bestClean
+	}
+	return best
+}
+
+func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*robinhood.Candidate) {
+	// Argmax(Score), but demote copycats: a same-symbol collision means we can't
+	// tell the real token from the imposter, so LPing one is a coin flip on
+	// holding the loser. Prefer any clean candidate; only pick a copycat when the
+	// whole batch is contested (then take the strongest, and say so).
+	best := pickBest(batch)
+	if best.IsCopycat {
+		log.Printf("scanner[%s]: DEPLOY PICK is a copycat (%s, %d share ticker %q) — no clean candidate this batch",
+			mode, best.Pool[:10], best.CopycatCount, best.BaseSymbol)
 	}
 
 	open, err := s.rhDep.OpenPositions(ctx)
@@ -255,6 +277,12 @@ func (s *Scanner) pollRobinhood(ctx context.Context, mp robinhood.ModeParams) {
 
 		batch = append(batch, cand)
 		batchKeys = append(batchKeys, poolKey)
+	}
+
+	// Copycat guard: flag same-symbol collisions within this batch (advisory —
+	// never rejects; the picker demotes flagged candidates). Cheap, no I/O.
+	if flagged := robinhood.EnrichCopycat(batch); flagged > 0 {
+		log.Printf("scanner[%s]: copycat guard flagged %d candidate(s)", mp.Mode, flagged)
 	}
 
 	sent := 0
