@@ -97,7 +97,13 @@ func Deployed(out string) bool {
 func Summarize(out string) string {
 	for _, marker := range []string{"🚀 DEPLOYED", "🧪 DRY RUN DEPLOY"} {
 		if i := strings.Index(out, marker); i >= 0 {
-			return "[robinhood] " + strings.TrimSpace(out[i:])
+			// Only the marker line — the executor prints a raw JSON result line
+			// right after it, which must not leak into the Telegram report.
+			line := out[i:]
+			if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+				line = line[:nl]
+			}
+			return "[robinhood] " + strings.TrimSpace(line)
 		}
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
