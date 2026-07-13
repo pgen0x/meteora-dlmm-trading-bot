@@ -115,6 +115,33 @@ function journalEntry(rec) {
   }
 }
 
+// resolveMintedTokenId pins the tokenId of the position just minted in `rcpt`.
+// An orphaned cost basis (tokenId="unknown") is a live-money footgun: the
+// monitor keys PnL off uni_positions.jsonl by tokenId, so a wrong/missing id
+// means entryWeth=null and SL/TP never fire on that position. Two independent
+// sources, most-precise first:
+//   1. the ERC721 Transfer(0x0 -> us) log from THIS mint tx (exact),
+//   2. the newest NPM token this wallet owns (authoritative post-mint; the
+//      just-minted position is the highest owner index).
+// Throws if both fail — better to surface a bare tx hash the operator can
+// journal by hand than to write an unmanageable position silently.
+async function resolveMintedTokenId(rcpt, account) {
+  const acct = account.address.toLowerCase();
+  const xfer = rcpt.logs.find((l) =>
+    l.address.toLowerCase() === NPM.toLowerCase() &&
+    l.topics.length === 4 &&                       // ERC721 Transfer (ERC20 has 3)
+    BigInt(l.topics[1]) === 0n &&                  // from == 0x0 (mint)
+    `0x${l.topics[2].slice(-40)}`.toLowerCase() === acct); // to == us
+  if (xfer) return BigInt(xfer.topics[3]).toString();
+  console.error("warn: mint Transfer log not found, falling back to NPM owner enumeration");
+  const bal = await pub.readContract({ address: NPM, abi: npmAbi, functionName: "balanceOf", args: [account.address] });
+  if (bal > 0n) {
+    const id = await pub.readContract({ address: NPM, abi: npmAbi, functionName: "tokenOfOwnerByIndex", args: [account.address, bal - 1n] });
+    return id.toString();
+  }
+  throw new Error("could not resolve minted tokenId (no Transfer log, wallet owns 0 positions)");
+}
+
 // readEntry returns the newest journal record for a tokenId, or null. The
 // monitor passes cost basis on the CLI too (--entry-weth), so a missing
 // journal (e.g. hand-created position) is not fatal.
@@ -312,9 +339,18 @@ async function cmdDeploy(wallet, account) {
   const hash = await wallet.writeContract({ address: NPM, abi: npmAbi, functionName: "mint", args: [mintArgs], account: wallet.account, chain });
   const rcpt = await pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
   if (rcpt.status !== "success") throw new Error(`mint reverted: ${hash}`);
-  // tokenId = ERC721 Transfer(0x0 -> us) log from the NPM contract.
-  const xfer = rcpt.logs.find((l) => l.address.toLowerCase() === NPM.toLowerCase() && l.topics.length === 4);
-  const tokenId = xfer ? BigInt(xfer.topics[3]).toString() : "unknown";
+  // Resolve tokenId from two independent sources; never journal "unknown" — an
+  // orphaned entry disables the monitor's SL/TP for that position.
+  let tokenId;
+  try {
+    tokenId = await resolveMintedTokenId(rcpt, account);
+  } catch (e) {
+    // Mint already landed on-chain; funds are committed. Surface the tx so the
+    // operator can journal the cost basis by hand rather than lose it silently.
+    console.error(`ERROR: mint ${hash} succeeded but tokenId unresolved: ${e.message}`);
+    console.log(JSON.stringify({ success: false, error: "tokenId unresolved", pool, strategy, tickLower, tickUpper, tx: hash, wethIn: formatEther(amountWeth) }));
+    return;
+  }
   // Cost basis = the full WETH committed this deploy (balanced_tight swapped
   // half into the token; both legs are still WETH-denominated capital).
   journalEntry({
