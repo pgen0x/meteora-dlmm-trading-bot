@@ -30,6 +30,13 @@ STATE_PATH = os.path.join(PROFILE_DIR, "memories", "uni_monitor_state.json")
 CLOSES_PATH = os.path.join(PROFILE_DIR, "memories", "uni_closes.jsonl")
 
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
+# Report-only: read positions + state + momentum, compute the decision label for
+# each, print a status card + MONITOR_REPORT JSON, and NEVER close or mutate the
+# persisted state file. This is the mode the Hermes reporting cron runs — the
+# systemd loop (rh-dlmm-monitor.service) owns the actual exits, so the cron is a
+# read-only mirror ("rules not cadence are the lever"). A report tick must never
+# race the loop's on-chain writes.
+REPORT_ONLY = "--report-only" in sys.argv
 
 # Exit thresholds — percentages, so identical to the Solana monitor's
 # (dlmm_monitor.py). "Same like solana" per the operator; recalibrate from the
@@ -163,14 +170,93 @@ def alert(text):
         pass
 
 
+def render_card(rows):
+    """Telegram status card for the reporting cron. Deterministic — the cron
+    prompt copies it verbatim, so the format lives here, not in the agent turn.
+    First line prefix is load-bearing (the cron's OUTPUT RULE keys off it)."""
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    lines = [f"Robinhood LP Status — {ts}"]
+    for r in rows:
+        pool_short = (r["pool"][:6] + "…" + r["pool"][-4:]) if r.get("pool") else "?"
+        pnl = f"{r['pnl_pct']:+.1f}%" if r["pnl_pct"] is not None else "n/a"
+        val = r["value_weth"]
+        ent = r["entry_weth"]
+        val_s = f"{val:.5f}" if val is not None else "?"
+        ent_s = f"{ent:.5f}" if ent is not None else "?"
+        age = f"{r['age_min']:.0f}m" if r["age_min"] is not None else "n/a"
+        rng = "in-range" if r["in_range"] else f"OUT ({r['oor_min']:.0f}m)"
+        m5 = f"{r['m5']:+.1f}%" if r["m5"] is not None else "n/a"
+        h1 = f"{r['h1']:+.1f}%" if r["h1"] is not None else "n/a"
+        lines += [
+            "",
+            f"Position #{r['tokenId']} | {pool_short}",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| PnL | {pnl} ({val_s} / {ent_s} WETH) |",
+            f"| Peak | {r['peak_pct']:.1f}% |",
+            f"| Range | {rng} |",
+            f"| Age | {age} |",
+            f"| Price 5m/1h | {m5} / {h1} |",
+            f"→ {r['decision']}: {r['reason']}",
+        ]
+    return "\n".join(lines)
+
+
 def main():
     pos, err = run_executor(["positions"])
     if err:
+        # Report-only must still hand the cron a parseable line so it can decide
+        # SILENT vs surface-the-error, instead of leaving the agent to guess.
+        if REPORT_ONLY:
+            print("MONITOR_REPORT:" + json.dumps({"positions": [], "error": err}))
+            sys.exit(1)
         print(f"monitor: positions read failed: {err}")
         sys.exit(1)
     ids = [p["tokenId"] for p in pos.get("positions", [])]
     if not ids:
+        if REPORT_ONLY:
+            print("MONITOR_REPORT:" + json.dumps({"positions": []}))
+            return
         print("monitor: no open positions")
+        return
+
+    if REPORT_ONLY:
+        state = load_state()
+        now = time.time()
+        rows = []
+        for tid in ids:
+            s, serr = run_executor(["state", "--id", str(tid)])
+            if serr or not s:
+                print(f"monitor: state #{tid} failed: {serr}")
+                continue
+            pnl = s.get("pnlPct")
+            in_range = bool(s.get("inRange"))
+            age_min = s.get("ageMin")
+            pool = s.get("pool")
+            # Read persisted peak/oor without mutating — the systemd loop owns
+            # writes to STATE_PATH; the report reflects its last tick.
+            ps = state.get(str(tid), {"peak_pnl": 0.0, "oor_since": None})
+            peak = ps.get("peak_pnl", 0.0)
+            if pnl is not None and pnl > peak:
+                peak = pnl
+            if in_range or not ps.get("oor_since"):
+                oor_min = 0.0
+            else:
+                oor_min = (now - ps["oor_since"]) / 60.0
+            m5, h1 = fetch_momentum(pool) if pool else (None, None)
+            reason = decide(pnl, peak, in_range, age_min, oor_min, m5, h1)
+            rows.append({
+                "tokenId": str(tid), "pool": pool,
+                "pnl_pct": round(pnl, 2) if pnl is not None else None,
+                "peak_pct": round(peak, 2), "in_range": in_range,
+                "oor_min": round(oor_min, 1), "age_min": round(age_min, 1) if age_min is not None else None,
+                "m5": m5, "h1": h1,
+                "value_weth": s.get("valueWeth"), "entry_weth": s.get("entryWeth"),
+                "decision": "CLOSE" if reason else "HOLD",
+                "reason": reason or "healthy — held by monitor loop",
+            })
+        print(render_card(rows))
+        print("MONITOR_REPORT:" + json.dumps({"positions": rows}))
         return
 
     state = load_state()

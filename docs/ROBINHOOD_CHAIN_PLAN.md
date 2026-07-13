@@ -152,15 +152,16 @@ scores every candidate) — picking is a plain argmax. Fails closed on any
 (monitor/exits) does not exist yet: a deployed position stays open until
 closed by hand via `uni_executor.js close --id N`.
 
-Currently running in production with `ROBINHOOD_DEPLOY_ENABLED=true` +
-profile `DRY_RUN=true` — dispatch triggers on a real qualifying batch but
-mints nothing (paper mode), the safest way to observe the full pick→deploy
-log path end-to-end before spending real WETH. **To go live**: remove/set
-`DRY_RUN=false` in `~/.hermes/profiles/solanza/.env` once a DRY_RUN cycle has
-been observed successfully.
+**LIVE since 2026-07-13**: `ROBINHOOD_DEPLOY_ENABLED=true` + profile
+`DRY_RUN=false` — the daemon now mints real positions with real WETH on a
+qualifying batch. Went live after the paper-mode (`DRY_RUN=true`) pick→deploy
+log path was observed end-to-end and Phase 3 (monitor exits) landed, so a
+deployed position auto-closes on the exit rules rather than sitting open until
+closed by hand. Capital is the funded wallet's ~0.0085 WETH; `uni_executor.js`
+sizes each deploy from that balance.
 
-**Remaining**: watch for a live DRY_RUN trigger to confirm the full path;
-Phase 3 monitor exits (trailing TP/SL, fast-out — port the Solana rulebook).
+**Remaining**: gate calibration from live journals (Phase 4) — no code gaps in
+the entry→monitor→exit→report loop.
 - `assets/skill/scripts/uni_executor.js` (or `.ts`) — viem +
   `@uniswap/v3-sdk`: wrap ETH→WETH, swap for target token, mint position
   (two-sided `balanced_tight` analog and one-sided above-price reseed),
@@ -199,8 +200,29 @@ Phase 3 monitor exits (trailing TP/SL, fast-out — port the Solana rulebook).
 - Peak/OOR-timer state persists in `memories/uni_monitor_state.json` across
   ticks. `DRY_RUN=true` tracks peaks + prints decisions but simulates closes.
 - With the monitor live, `ROBINHOOD_MAX_OPEN_POSITIONS` is no longer the
-  *only* safety brake — positions now auto-close on the exit rules. Safe to
-  set `DRY_RUN=false` after observing one dry-run deploy+monitor cycle.
+  *only* safety brake — positions now auto-close on the exit rules.
+  `DRY_RUN=false` set 2026-07-13 (after a dry-run monitor cycle was observed).
+
+### Phase 3b — Hermes reporting cron ✅ (landed 2026-07-13)
+Operator-facing visibility, the EVM analog of Solana's `sol_dlmm_position_monitor`
+cron. Distinct from the systemd loop: the loop *acts* (closes), the cron only
+*reports*.
+- `uni_monitor.py --report-only` — pure read: positions + persisted peak/OOR
+  state + GeckoTerminal momentum → a "Robinhood LP Status" card + a
+  `MONITOR_REPORT:{...}` JSON line. **Never** closes or writes
+  `uni_monitor_state.json`, so a report tick can't race the loop's on-chain
+  writes (the loop owns all state mutation). Empty positions → parseable
+  `{"positions":[]}`; a positions-read failure → `{"positions":[],"error":...}`
+  so the agent surfaces the error instead of fabricating a card.
+- Cron `rh_dlmm_position_monitor` in `assets/hermes/cron_jobs_template.json`
+  (installed live in the `solanza` profile, `deliver=telegram`, every 30m,
+  `terminal` toolset only). Prompt hard-forbids trading (no executor, no
+  close/mint) and copies the script's card verbatim; empty positions → `[SILENT]`.
+- Validated 2026-07-13: `hermes cron run` → ok, 0 open positions → SILENT (no
+  spam). Card format proven against a synthetic 2-position sample.
+- Parity choice to revisit: `[SILENT]` on empty mirrors the Solana monitor, but
+  the operator has said "don't silent until I ask" — may want a heartbeat card
+  instead (one-line prompt change).
 
 Original Phase 3 sketch (superseded by the above):
 
