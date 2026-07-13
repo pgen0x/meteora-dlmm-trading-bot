@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/meteora-dlmm-trading-bot/internal/robinhood"
 )
 
 // Config holds all runtime settings, sourced from environment variables.
@@ -112,10 +114,17 @@ type Config struct {
 	// RobinhoodDeployTimeout bounds one uni_executor.js invocation
 	// (swap + mint can take a few blocks even at Robinhood Chain's ~100ms pace).
 	RobinhoodDeployTimeout time.Duration
-	// RobinhoodDeployAmountWeth is the fixed WETH size per deploy. Fixed
-	// (not balance-derived) until the venue has enough live data to justify
-	// dynamic sizing — start small.
-	RobinhoodDeployAmountWeth float64
+	// RobinhoodSize sizes each deploy dynamically from the live WETH balance
+	// (robinhood.ComputeDeployAmount) — the venue's port of the Solana
+	// pipeline's compute_deploy_amount. Replaces the old fixed
+	// ROBINHOOD_DEPLOY_AMOUNT_WETH, which minted a flat 0.003 WETH regardless of
+	// wallet size (~17% of a 0.0174 WETH stack) and never grew with the balance.
+	RobinhoodSize robinhood.SizeParams
+	// RobinhoodMinGasEth is the native-ETH floor required to deploy. Unlike
+	// Solana — where SOL is gas AND quote, so one reserve covers both — this
+	// venue pays gas in ETH but LPs in WETH, so a wallet flush with WETH can
+	// still be unable to pay for the mint. Fail closed below this.
+	RobinhoodMinGasEth float64
 	// RobinhoodDeployStrategy is the uni_executor.js mint strategy:
 	// "balanced_tight" (two-sided, swaps half) or "weth_below" (one-sided).
 	RobinhoodDeployStrategy string
@@ -232,8 +241,18 @@ func Load() Config {
 		RobinhoodDeployEnabled:    getbool("ROBINHOOD_DEPLOY_ENABLED", false),
 		RobinhoodExecutorCmd:      getenv("ROBINHOOD_EXECUTOR_CMD", ""),
 		RobinhoodDeployTimeout:    getdur("ROBINHOOD_DEPLOY_TIMEOUT", 2*time.Minute),
-		RobinhoodDeployAmountWeth: getfloat("ROBINHOOD_DEPLOY_AMOUNT_WETH", 0.003),
-		RobinhoodDeployStrategy:   getenv("ROBINHOOD_DEPLOY_STRATEGY", "balanced_tight"),
+		RobinhoodSize: robinhood.SizeParams{
+			// Same 45% pct as the Solana pipeline. Floor is the old fixed size —
+			// a position smaller than that isn't worth its gas + round-trip swap.
+			// Ceil bounds a single position while the venue is still young; raise
+			// it as the wallet and the venue's close journal grow.
+			ReserveWeth: getfloat("ROBINHOOD_DEPLOY_RESERVE_WETH", 0.002),
+			Pct:         getfloat("ROBINHOOD_DEPLOY_PCT", 0.45),
+			FloorWeth:   getfloat("ROBINHOOD_DEPLOY_FLOOR_WETH", 0.003),
+			CeilWeth:    getfloat("ROBINHOOD_DEPLOY_CEIL_WETH", 0.05),
+		},
+		RobinhoodMinGasEth:      getfloat("ROBINHOOD_MIN_GAS_ETH", 0.0002),
+		RobinhoodDeployStrategy: getenv("ROBINHOOD_DEPLOY_STRATEGY", "balanced_tight"),
 		RobinhoodRangePct:         getfloat("ROBINHOOD_RANGE_PCT", 10),
 		RobinhoodSlippagePct:      getfloat("ROBINHOOD_SLIPPAGE_PCT", 5),
 		RobinhoodMaxOpenPositions: getint("ROBINHOOD_MAX_OPEN_POSITIONS", 1),

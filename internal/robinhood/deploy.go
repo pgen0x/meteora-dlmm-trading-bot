@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -61,14 +62,97 @@ func (r *Runner) OpenPositions(ctx context.Context) (int, error) {
 	}
 	// The executor's last stdout line is the JSON payload; earlier lines (if
 	// any) are transaction log noise from other commands, never `positions`.
-	line := out
-	if i := strings.LastIndex(strings.TrimSpace(out), "\n"); i >= 0 {
-		line = strings.TrimSpace(out)[i+1:]
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &d); err != nil {
+	if err := json.Unmarshal([]byte(lastLine(out)), &d); err != nil {
 		return 0, fmt.Errorf("positions: unparseable output: %w", err)
 	}
 	return d.Count, nil
+}
+
+// Balances is the wallet's spendable capital, in ether units. The two are NOT
+// interchangeable here: ETH is native gas, WETH is the LP quote asset. That is
+// this venue's one structural divergence from Solana, where SOL is both — so
+// dlmm_pipeline.compute_deploy_amount's single `reserve` becomes two guards:
+// a WETH reserve (below) and a native-gas floor (checked by the caller).
+type Balances struct {
+	ETH  float64
+	WETH float64
+}
+
+// Balance reads the wallet via `uni_executor.js balance`. Like OpenPositions,
+// callers MUST fail closed on error: sizing a deploy off an unknown balance
+// would either overspend or mint a dust position.
+func (r *Runner) Balance(ctx context.Context) (Balances, error) {
+	out, err := r.run(ctx, "balance")
+	if err != nil {
+		return Balances{}, err
+	}
+	// The executor emits balances as decimal STRINGS (viem formatEther output),
+	// not JSON numbers — float64 fields here would fail to unmarshal.
+	var d struct {
+		ETH  string `json:"eth"`
+		WETH string `json:"weth"`
+	}
+	if err := json.Unmarshal([]byte(lastLine(out)), &d); err != nil {
+		return Balances{}, fmt.Errorf("balance: unparseable output: %w", err)
+	}
+	eth, err := strconv.ParseFloat(d.ETH, 64)
+	if err != nil {
+		return Balances{}, fmt.Errorf("balance: bad eth %q: %w", d.ETH, err)
+	}
+	weth, err := strconv.ParseFloat(d.WETH, 64)
+	if err != nil {
+		return Balances{}, fmt.Errorf("balance: bad weth %q: %w", d.WETH, err)
+	}
+	return Balances{ETH: eth, WETH: weth}, nil
+}
+
+// SizeParams configures ComputeDeployAmount — the WETH analogues of the Solana
+// pipeline's compute_deploy_amount constants (reserve/pct/floor/ceil).
+type SizeParams struct {
+	ReserveWeth float64 // held back, never deployed
+	Pct         float64 // fraction of the deployable balance per position
+	FloorWeth   float64 // smallest position worth its gas + round-trip swap cost
+	CeilWeth    float64 // hard cap per position (0 = uncapped)
+}
+
+// ComputeDeployAmount sizes one position from the live WETH balance — the port
+// of dlmm_pipeline.py's compute_deploy_amount (reserve 0.2 SOL, pct 0.45,
+// floor 0.3, ceil 5.0).
+//
+// Taking a PERCENTAGE of the remaining balance rather than a fixed size is the
+// whole point: each open position shrinks the base for the next one, so total
+// exposure tapers as positions stack instead of marching linearly to a zero
+// balance — and it scales up as the wallet grows, with no config edit. A fixed
+// 0.003 WETH size was deploying only ~17% of a 0.0174 WETH wallet.
+//
+// Returns 0 to mean SKIP THIS DEPLOY — callers must treat it as a skip, never
+// as "deploy nothing". A sub-floor position isn't worth its gas and swap costs,
+// so it is declined outright rather than minted as dust.
+func ComputeDeployAmount(wethBalance float64, p SizeParams) float64 {
+	deployable := wethBalance - p.ReserveWeth
+	if deployable < p.FloorWeth {
+		return 0 // can't even fund a floor-sized position — skip
+	}
+	amount := deployable * p.Pct
+	if amount < p.FloorWeth {
+		// Affordable in total, but below the floor after the percentage haircut:
+		// deploy exactly the floor (the check above proved we can cover it).
+		amount = p.FloorWeth
+	}
+	if p.CeilWeth > 0 && amount > p.CeilWeth {
+		amount = p.CeilWeth
+	}
+	return amount
+}
+
+// lastLine returns the final non-empty stdout line — the executor's JSON
+// payload, after any transaction-log noise.
+func lastLine(out string) string {
+	t := strings.TrimSpace(out)
+	if i := strings.LastIndex(t, "\n"); i >= 0 {
+		return strings.TrimSpace(t[i+1:])
+	}
+	return t
 }
 
 // Deploy mints one position via `uni_executor.js deploy` and returns its

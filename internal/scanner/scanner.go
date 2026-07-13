@@ -184,10 +184,33 @@ func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*rob
 		return
 	}
 
-	log.Printf("scanner[%s]: DEPLOY PICK %s (%s) score=%.0f amount=%g WETH strategy=%s",
-		mode, best.BaseSymbol, best.Pool[:10], best.Score, s.cfg.RobinhoodDeployAmountWeth, s.cfg.RobinhoodDeployStrategy)
+	// Size from the LIVE wallet, not a fixed constant — same rationale as the
+	// Solana pipeline's compute_deploy_amount. Fail closed on a balance we
+	// cannot read: guessing a size is how you overspend or mint dust.
+	bal, err := s.rhDep.Balance(ctx)
+	if err != nil {
+		log.Printf("scanner[%s]: DEPLOY SKIPPED (balance unknown, failing closed): %v", mode, err)
+		return
+	}
+	// Gas is native ETH here, not the WETH we LP with — a WETH-rich wallet can
+	// still be too broke to pay for the mint.
+	if bal.ETH < s.cfg.RobinhoodMinGasEth {
+		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): gas %.6f ETH < %.6f floor — fund the wallet",
+			mode, best.BaseSymbol, best.Pool[:10], bal.ETH, s.cfg.RobinhoodMinGasEth)
+		return
+	}
+	amount := robinhood.ComputeDeployAmount(bal.WETH, s.cfg.RobinhoodSize)
+	if amount <= 0 {
+		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): %.5f WETH balance cannot fund a %.5f floor position (reserve %.5f)",
+			mode, best.BaseSymbol, best.Pool[:10], bal.WETH, s.cfg.RobinhoodSize.FloorWeth, s.cfg.RobinhoodSize.ReserveWeth)
+		return
+	}
 
-	out, err := s.rhDep.Deploy(ctx, best.Pool, s.cfg.RobinhoodDeployAmountWeth, s.cfg.RobinhoodRangePct, s.cfg.RobinhoodSlippagePct, s.cfg.RobinhoodDeployStrategy)
+	log.Printf("scanner[%s]: DEPLOY PICK %s (%s) score=%.0f amount=%.5f WETH (%.0f%% of %.5f bal, reserve %.5f) strategy=%s",
+		mode, best.BaseSymbol, best.Pool[:10], best.Score, amount,
+		s.cfg.RobinhoodSize.Pct*100, bal.WETH, s.cfg.RobinhoodSize.ReserveWeth, s.cfg.RobinhoodDeployStrategy)
+
+	out, err := s.rhDep.Deploy(ctx, best.Pool, amount, s.cfg.RobinhoodRangePct, s.cfg.RobinhoodSlippagePct, s.cfg.RobinhoodDeployStrategy)
 	if err != nil {
 		log.Printf("scanner[%s]: DEPLOY FAILED %s (%s): %v\n%s", mode, best.BaseSymbol, best.Pool[:10], err, out)
 		return
