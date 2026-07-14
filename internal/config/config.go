@@ -79,8 +79,15 @@ type Config struct {
 	// DeployCmd, because the deploy pipeline only speaks Solana (see
 	// docs/ROBINHOOD_CHAIN_PLAN.md). Off by default.
 	EnableRobinhood bool
+	// EnableRobinhoodMature turns on the venue's SECOND mode (rh-mature):
+	// established pools still printing outsized fee/TVL, discovered through
+	// Uniswap's own interface gateway rather than GeckoTerminal. Independent of
+	// EnableRobinhood on purpose — the two modes share every safety gate but no
+	// discovery source, and either can run alone. Off by default.
+	EnableRobinhoodMature bool
 	// RobinhoodDiscoverURL overrides the GeckoTerminal new_pools endpoint
 	// (empty = the package default). The public tier allows 30 req/min.
+	// Applies to the Fresh mode only; rh-mature has its own source.
 	RobinhoodDiscoverURL string
 	// RobinhoodSeenTTL is the venue's dedup window. Fresh-pool signals age out
 	// of the thesis within a day; 6h lets a still-qualifying pool re-signal.
@@ -236,6 +243,7 @@ func Load() Config {
 		LoneMinScore:              getfloat("LONE_MIN_SCORE", 50),
 		EnablePVPCheck:            getbool("ENABLE_PVP_CHECK", true),
 		EnableRobinhood:           getbool("ROBINHOOD_ENABLED", false),
+		EnableRobinhoodMature:     getbool("ROBINHOOD_MATURE", false),
 		RobinhoodDiscoverURL:      getenv("ROBINHOOD_DISCOVER_URL", ""),
 		RobinhoodWebhook:          getbool("ROBINHOOD_WEBHOOK", false),
 		RobinhoodDeployEnabled:    getbool("ROBINHOOD_DEPLOY_ENABLED", false),

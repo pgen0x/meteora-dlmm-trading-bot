@@ -1,10 +1,18 @@
-// Package robinhood discovers and screens newly-created Uniswap v3 pools on
-// Robinhood Chain (chain ID 4663) via the GeckoTerminal public API, mirroring
-// the internal/meteora poll ▸ screen ▸ dedup ▸ forward flow for the EVM venue.
+// Package robinhood discovers and screens Uniswap v3 pools on Robinhood Chain
+// (chain ID 4663), mirroring the internal/meteora poll ▸ screen ▸ dedup ▸
+// forward flow for the EVM venue.
 //
-// Phase 1 scope (docs/ROBINHOOD_CHAIN_PLAN.md): signal-only — candidates are
-// forwarded to the webhook sink for observation; the direct-deploy runner is
-// never invoked for this venue until the EVM executor lands (Phase 2).
+// Two modes with two discovery sources, because no single feed spans both
+// theses (see docs/ROBINHOOD_CHAIN_PLAN.md):
+//
+//   - rh-fresh (discover.go) — newly-created pools, from GeckoTerminal's
+//     new_pools launch feed. A pool scrolls off it within minutes.
+//   - rh-mature (mature.go) — established pools still printing outsized
+//     fee/TVL, from Uniswap's own interface GraphQL gateway, which indexes
+//     nothing younger than about a day.
+//
+// Both share every downstream gate: Screen, the safety fetches (safety.go) and
+// the copycat guard (copycat.go).
 package robinhood
 
 import (
@@ -151,7 +159,7 @@ type Candidate struct {
 	McapUSD      float64 `json:"mcap_usd"`
 	VolumeH1USD  float64 `json:"volume_h1_usd"`
 	VolumeH24USD float64 `json:"volume_h24_usd"`
-	FeeTVLDayPct float64 `json:"fee_tvl_day_pct"` // projected daily fee/TVL %, from h1 volume pace
+	FeeTVLDayPct float64 `json:"fee_tvl_day_pct"` // daily fee/TVL %: h1 pace extrapolated (rh-fresh) or realized 24h volume (rh-mature)
 	TxH1         int     `json:"tx_h1"`
 	BuyersH1     int     `json:"buyers_h1"`
 	SellersH1    int     `json:"sellers_h1"`

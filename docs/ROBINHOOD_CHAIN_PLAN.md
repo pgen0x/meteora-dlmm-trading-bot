@@ -239,6 +239,86 @@ Original Phase 3 sketch (superseded by the above):
   vector — needs its own safety screen), UniswapX, tokenized-stock LP mode
   (different regime: low vol, fee-capture only).
 
+### Phase 5 — `rh-mature` mode: established fee-printers ✅ (landed 2026-07-14)
+
+Phase 1–4 only ever saw the launch window. That was a **structural blind spot,
+not a threshold choice**: GeckoTerminal's `new_pools` is a launch feed, a pool
+scrolls off it in minutes, and `Fresh.MaxAge` rejects anything over 24h. Pools
+that survive their launch and keep printing fees for days were invisible to us.
+
+**Discovery source: Uniswap's own interface GraphQL gateway** —
+`https://interface.gateway.uniswap.org/v1/graphql`, the backend behind
+app.uniswap.org's Explore ▸ Pools table. Keyless, unauthenticated, speaks
+`chain: ROBINHOOD` natively (verified 2026-07-14). Needs a browser-shaped
+`Origin` header. Schema introspection is disabled; operation names come from the
+interface's own network traffic.
+
+Measured shape of `topV3Pools(chain: ROBINHOOD)` on 2026-07-14:
+
+- Returns the **entire indexed universe: 74 pools**, sorted TVL descending,
+  bottoming out at ~$12.6k TVL (`tvlCursor` pages down to it, then stops).
+- **Zero pools younger than 24h.** It is a TVL leaderboard with an indexing lag,
+  NOT a discovery feed — so it cannot replace `new_pools` for `rh-fresh`, and
+  `new_pools` cannot serve `rh-mature`. The two modes need two sources. That is
+  the whole reason `pollRobinhood` takes an `rhFetcher`.
+- Gives: address, `createdAtTimestamp`, `feeTier` (hundredths of a bip),
+  `totalLiquidity`, `cumulativeVolume(duration: DAY)`, token0/token1 with
+  decimals. token0/token1 are ordered **by address, not by role** — WETH lands
+  on either side, hence `toPool`'s orientation step.
+- Does NOT give: h1 volume, buys/sells/buyers/sellers, price-change windows, or
+  FDV. `cumulativeVolume` rejects an `HOUR` duration; DAY is the finest window.
+
+**Two-hop fetch** (`mature.go`), two HTTP calls per cycle:
+
+1. Gateway → whole v3 universe (TVL, fee tier, age, 24h volume).
+2. Local prefilter (no I/O, a strict subset of `Screen`) → ONE GeckoTerminal
+   `/pools/multi/` call (takes up to 30 addresses) fills in the h1 flow,
+   price-change windows and FDV that `Screen` gates on.
+
+The prefilter is load-bearing: without it this fans out per-pool and burns the
+GT budget `rh-fresh` depends on (the keyless tier really throttles at ~4 req/min
+— see `discover.go`).
+
+**`Mature` gates** — start where `Fresh` ends so the two modes partition the age
+axis and no pool can signal twice: age ≥24h, **no ceiling** (`MaxAge: 0`; a pool
+printing fees for a month is more proven, not less — the fee-pace gate expires a
+stale pool on evidence, not on a clock), reserve $12.5k–$500k (5× Fresh's floor:
+this mode holds for days and needs an exit), fee tier ≥0.25%, fee/TVL **≥8%/day**
+(~2900% APR), ≥60 txns + ≥20 buyers h1, FDV $20k–$50M.
+
+**`FeePaceH24`** is the one new `ModeParams` knob. Fresh extrapolates the h1
+window out to a day because a minutes-old pool has no other history; a mature
+pool has a realized 24h volume, and extrapolating h1 would let one busy hour
+mint a 24×-inflated daily rate — precisely the pool this mode must not buy.
+
+**Live calibration run (2026-07-14), and the finding that matters:**
+
+| | |
+|---|---|
+| Gateway universe | 74 pools |
+| Cleared a 5%/day fee pace inside the reserve band | 19 — **every one 66–144h old**, i.e. 100% invisible to `rh-fresh` |
+| Shortlist after `Mature` prefilter (8%/day) | 7 |
+| Passed the full `Screen` | **1** (MEOW/WETH: 9.0%/day, $82k TVL, 46 buyers/h) |
+
+Of the 6 rejects, **4 failed the momentum gates, not the yield gates.**
+DATABEAR/WETH — the headline pool, $65k TVL, $1.44M 24h volume, 1% tier =
+**22%/day ≈ 8000% APR** — was rejected on `1h -18.3%`. That is the APR trap
+stated precisely: **on these pools a spectacular fee yield is frequently being
+paid by a collapsing price**, and impermanent loss eats the fees. The existing
+momentum gates already catch it; no new gate was needed, and the high-yield
+rejects are the point of the mode, not a bug in it.
+
+Config: `ROBINHOOD_MATURE=true` (independent of `ROBINHOOD_ENABLED` — either mode
+runs alone). Every downstream gate is shared and unmodified: dedup
+(`rh:rh-mature:<pool>`), Blockscout holders, GMGN security + holder quality,
+copycat guard, and the same deploy path.
+
+**Open**: thresholds are FIRST-PASS, calibrated on one 74-pool sample — expect
+churn. `MinTxH1: 60` already rejected one pool (MEOWOOD, 52 txns) that may
+deserve to pass. `ROBINHOOD_SEEN_TTL=6h` means a still-qualifying mature pool
+re-signals every 6h; that is arguably correct for a re-entry candidate, but it is
+untested and interacts with `ROBINHOOD_MAX_OPEN_POSITIONS`.
+
 ## 4. Risks / open questions
 
 1. **GoPlus coverage of chain 4663** unverified — if unsupported at launch,

@@ -97,8 +97,9 @@ func (s *Scanner) modes() []meteora.ModeParams {
 
 // Run blocks, polling on PollInterval until ctx is cancelled.
 func (s *Scanner) Run(ctx context.Context) {
-	log.Printf("scanner: started (interval=%v, casual=%v, multiday=%v, turnover=%v, momentum=%v, robinhood=%v)",
-		s.cfg.PollInterval, s.cfg.EnableCasual, s.cfg.EnableMultiday, s.cfg.EnableTurnover, s.cfg.EnableMomentumGate, s.cfg.EnableRobinhood)
+	log.Printf("scanner: started (interval=%v, casual=%v, multiday=%v, turnover=%v, momentum=%v, robinhood=%v, rh-mature=%v)",
+		s.cfg.PollInterval, s.cfg.EnableCasual, s.cfg.EnableMultiday, s.cfg.EnableTurnover, s.cfg.EnableMomentumGate,
+		s.cfg.EnableRobinhood, s.cfg.EnableRobinhoodMature)
 
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
@@ -120,7 +121,19 @@ func (s *Scanner) pollAll(ctx context.Context) {
 		s.pollMode(ctx, mp)
 	}
 	if s.cfg.EnableRobinhood {
-		s.pollRobinhood(ctx, robinhood.Fresh)
+		// Each mode brings its own discovery source: the two theses sit on
+		// opposite sides of a 24h age line and NO single feed spans both.
+		// GeckoTerminal's new_pools is a launch feed (a pool scrolls off it in
+		// minutes); Uniswap's gateway is a TVL leaderboard that indexes nothing
+		// younger than a day. See mature.go.
+		s.pollRobinhood(ctx, robinhood.Fresh, func(time.Time) ([]robinhood.Pool, error) {
+			return robinhood.FetchNewPools(s.cfg.RobinhoodDiscoverURL)
+		})
+	}
+	if s.cfg.EnableRobinhoodMature {
+		s.pollRobinhood(ctx, robinhood.Mature, func(now time.Time) ([]robinhood.Pool, error) {
+			return robinhood.FetchMaturePools(robinhood.Mature, now)
+		})
 	}
 }
 
@@ -225,13 +238,18 @@ func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*rob
 	}
 }
 
-func (s *Scanner) pollRobinhood(ctx context.Context, mp robinhood.ModeParams) {
-	pools, err := robinhood.FetchNewPools(s.cfg.RobinhoodDiscoverURL)
+// rhFetcher is a mode's discovery source. It takes the cycle's clock so the
+// mature source can age-filter before spending its enrichment budget, keeping
+// the single clock read at this edge (see the no-hidden-clock-reads rule).
+type rhFetcher func(now time.Time) ([]robinhood.Pool, error)
+
+func (s *Scanner) pollRobinhood(ctx context.Context, mp robinhood.ModeParams, fetch rhFetcher) {
+	now := time.Now()
+	pools, err := fetch(now)
 	if err != nil {
 		log.Printf("scanner[%s]: fetch error: %v", mp.Mode, err)
 		return
 	}
-	now := time.Now()
 
 	var screened, deduped, holderRejected, secRejected, hqRejected, gmgnEnriched int
 	rejects := map[string]int{}

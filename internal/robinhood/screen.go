@@ -15,16 +15,24 @@ type ModeParams struct {
 	Mode string
 
 	MinAge time.Duration // dodge the first sniper/MEV minutes of a launch
-	MaxAge time.Duration // stay inside the "fresh pool" thesis window
+	MaxAge time.Duration // stay inside the mode's thesis window (0 disables)
 
 	MinReserveUSD float64 // liquidity floor: LP fees on dust reserves round to zero
 	MaxReserveUSD float64 // ceiling biases small pools where our share matters (0 disables)
 	MinFeePct     float64 // v3 fee tier floor; memecoin launches sit at 1% (Noxa default)
-	MinFeeTVLDay  float64 // projected daily fee/TVL % floor (h1 volume pace x fee tier)
+	MinFeeTVLDay  float64 // projected daily fee/TVL % floor (volume pace x fee tier)
 	MinTxH1       int     // swaps in the last hour (wash guard with MinBuyersH1)
 	MinBuyersH1   int     // unique buyers in the last hour
 	MinFdvUSD     float64 // FDV sanity floor
 	MaxFdvUSD     float64 // FDV sanity ceiling (0 disables): fake-priced pools show absurd FDV
+
+	// FeePaceH24 measures the fee/TVL pace over the realized 24h volume instead
+	// of extrapolating the h1 window out to a day. Modes selecting for
+	// SUSTAINED fee generation must set it: under h1 extrapolation one busy
+	// hour mints a 24x-inflated daily rate, which is precisely the pool a
+	// mature mode must not buy. Fresh leaves it false — a pool minutes old has
+	// no 24h history to measure, so extrapolating is the only option it has.
+	FeePaceH24 bool
 }
 
 // Fresh is the starter mode: young Uniswap v3 WETH pools already showing
@@ -47,6 +55,53 @@ var Fresh = ModeParams{
 	MinBuyersH1:   12,
 	MinFdvUSD:     20000,
 	MaxFdvUSD:     50_000_000,
+}
+
+// Mature is the second mode: pools PAST the launch window that are still
+// printing outsized fees on real liquidity. It exists because Fresh and
+// GeckoTerminal's new_pools feed are structurally blind to them — a pool
+// scrolls off new_pools within minutes, and Fresh.MaxAge rejects anything over
+// 24h. The live 2026-07-14 sample made the gap concrete: 19 of 62 indexed v3
+// pools cleared a 5%/day fee pace inside the reserve band, and every one was
+// 66-144h old (DATABEAR/WETH: $65k TVL, $1.44M 24h volume, 1% tier = 22%/day,
+// roughly 8000% APR). Fed by FetchMaturePools (Uniswap's gateway), not
+// FetchNewPools.
+//
+// FIRST-PASS values like Fresh's — expect churn once the journals land.
+var Mature = ModeParams{
+	Mode: "rh-mature",
+
+	// Starts exactly where Fresh ends, so the two modes partition the age axis
+	// and no pool can signal twice. No ceiling: a pool that has printed fees
+	// for a week is MORE proven, not less — the fee-pace gate is what expires a
+	// stale pool, and it does so on evidence rather than on a clock.
+	MinAge: 24 * time.Hour,
+	MaxAge: 0,
+
+	// 12500 tracks the floor of what Uniswap's gateway actually indexes (~$12.6k
+	// on the live sample) — below it we would gate on pools the discovery source
+	// cannot see anyway. It is also 5x Fresh's floor on purpose: Fresh accepts
+	// thin books because it is paid for launch-window volatility, while this
+	// mode holds for days and needs an exit.
+	MinReserveUSD: 12500,
+	MaxReserveUSD: 500000,
+	MinFeePct:     0.25,
+
+	// 8%/day (~2900% APR) against Fresh's 5%. A mature pool competes on
+	// SUSTAINED yield and has a full 24h of history to prove it, so the bar
+	// should be higher than the one a minutes-old pool clears on extrapolation.
+	// Sample check: 19/62 pools cleared 5%, only 5 cleared 8% — a shortlist,
+	// which is what the single-position cap wants.
+	MinFeeTVLDay: 8.0,
+	FeePaceH24:   true,
+
+	// Higher flow floors than Fresh (30/12): these pools have hours of history,
+	// so a quiet hour here is real evidence of decay rather than a cold start.
+	MinTxH1:     60,
+	MinBuyersH1: 20,
+
+	MinFdvUSD: 20000,
+	MaxFdvUSD: 50_000_000,
 }
 
 // Score saturation targets, degen-score analogs computed over the h1 window.
@@ -76,7 +131,7 @@ func Screen(p Pool, mp ModeParams, now time.Time) (*Candidate, string) {
 	if age < mp.MinAge {
 		return nil, fmt.Sprintf("too-young %dm < %dm", int(age.Minutes()), int(mp.MinAge.Minutes()))
 	}
-	if age > mp.MaxAge {
+	if mp.MaxAge > 0 && age > mp.MaxAge {
 		return nil, fmt.Sprintf("too-old %.1fh > %.1fh", age.Hours(), mp.MaxAge.Hours())
 	}
 
@@ -90,12 +145,17 @@ func Screen(p Pool, mp ModeParams, now time.Time) (*Candidate, string) {
 		return nil, fmt.Sprintf("fee tier %.2f%% < %.2f%%", p.FeePct, mp.MinFeePct)
 	}
 
-	// Projected daily fee/TVL from the h1 pace. GeckoTerminal has no fee
-	// field; v3 fees are deterministic (volume x tier), so this is exact for
-	// the window it extrapolates.
+	// Daily fee/TVL. Neither source exposes a fee field, but v3 fees are
+	// deterministic (volume x tier), so this is exact for the window it reads.
+	// Fresh extrapolates the h1 window (it has no more history); FeePaceH24
+	// modes read the realized 24h volume instead — see the field's comment.
 	feeTVLDay := 0.0
 	if p.ReserveUSD > 0 {
-		feeTVLDay = (p.VolumeH1USD * 24 * p.FeePct / 100) / p.ReserveUSD * 100
+		dayVolume := p.VolumeH1USD * 24
+		if mp.FeePaceH24 {
+			dayVolume = p.VolumeH24USD
+		}
+		feeTVLDay = (dayVolume * p.FeePct / 100) / p.ReserveUSD * 100
 	}
 	if feeTVLDay < mp.MinFeeTVLDay {
 		return nil, fmt.Sprintf("fee/TVL pace %.1f%%/d < %.1f%%/d", feeTVLDay, mp.MinFeeTVLDay)
