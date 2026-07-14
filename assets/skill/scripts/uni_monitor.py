@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""uni_monitor.py — Robinhood Chain (Uniswap v3) position monitor.
+"""uni_monitor.py — Robinhood Chain (Uniswap v3 + v4) position monitor.
 
 EVM sibling of dlmm_monitor.py. One-shot scan (run on a loop by
-uni_monitor_loop.sh): reads open NonfungiblePositionManager positions, prices
-each via `uni_executor.js state`, and applies the SAME exit rulebook the Solana
-monitor uses — hard SL/TP, trailing profit-ratchet, fast-out velocity exit,
-sustained-downtrend exit, and out-of-range timeout — closing through
-`UNI_CLOSE_AUTH=1 uni_executor.js close` when a rule trips.
+uni_monitor_loop.sh): reads open positions from BOTH executors — v3 via
+uni_executor.js (NonfungiblePositionManager) and v4 via uni_v4_executor.js
+(the v4 PositionManager; skipped when the script is absent) — and applies the
+SAME exit rulebook the Solana monitor uses — hard SL/TP, trailing
+profit-ratchet, fast-out velocity exit, sustained-downtrend exit, and
+out-of-range timeout — closing through `UNI_CLOSE_AUTH=1 <executor> close`
+when a rule trips.
 
-This is the ONLY authorized closer for the venue (the executor's close command
-refuses to run without UNI_CLOSE_AUTH=1 or --force), mirroring the Solana
-monitor's DLMM_CLOSE_AUTH contract. PnL is WETH-denominated (the venue's quote
-asset), the analog of the Solana monitor's SOL terms.
+This is the ONLY authorized closer for the venue (both executors' close
+commands refuse to run without UNI_CLOSE_AUTH=1 or --force), mirroring the
+Solana monitor's DLMM_CLOSE_AUTH contract. PnL is quote-denominated: WETH on
+v3, the pool's own quote asset on v4 (WETH, native ETH, or USDG — the state
+output's `quoteSymbol` says which). The rulebook is percentages, so the
+thresholds are unit-agnostic and shared across protocols.
 
 DRY_RUN=true still tracks peaks and prints decisions, but simulates closes.
 """
@@ -25,7 +29,15 @@ import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR)))
-EXECUTOR = os.path.join(SCRIPT_DIR, "uni_executor.js")
+# (protocol, executor path) pairs, monitored in order. v4 rides the same tick
+# only when its script is deployed — an absent file is pre-Phase-7, not an
+# error. v3 state keys stay bare tokenIds (the live state file predates v4);
+# v4 keys are namespaced "v4:<tokenId>" because the two PositionManagers mint
+# independent, colliding tokenId sequences.
+EXECUTORS = [("v3", os.path.join(SCRIPT_DIR, "uni_executor.js"))]
+_V4_EXECUTOR = os.path.join(SCRIPT_DIR, "uni_v4_executor.js")
+if os.path.exists(_V4_EXECUTOR):
+    EXECUTORS.append(("v4", _V4_EXECUTOR))
 STATE_PATH = os.path.join(PROFILE_DIR, "memories", "uni_monitor_state.json")
 CLOSES_PATH = os.path.join(PROFILE_DIR, "memories", "uni_closes.jsonl")
 
@@ -54,14 +66,14 @@ MAX_OOR_MINUTES = 30.0             # out-of-range this long -> close (fee-dead)
 MIN_AGE_MIN_BEFORE_SL = 5.0        # grace so a fresh mint's settling isn't an SL
 
 
-def run_executor(args, close_auth=False):
-    """Run uni_executor.js and return (parsed_json, err). Reads the last stdout
-    line as the JSON payload."""
+def run_executor(executor, args, close_auth=False):
+    """Run an executor script and return (parsed_json, err). Reads the last
+    stdout line as the JSON payload."""
     env = dict(os.environ)
     if close_auth:
         env["UNI_CLOSE_AUTH"] = "1"
     try:
-        r = subprocess.run(["node", EXECUTOR] + args, capture_output=True,
+        r = subprocess.run(["node", executor] + args, capture_output=True,
                            text=True, timeout=150, env=env)
         out = (r.stdout or "").strip()
         line = out.splitlines()[-1] if out else ""
@@ -114,6 +126,23 @@ def fetch_momentum(pool):
         return float(pc.get("m5") or 0), float(pc.get("h1") or 0)
     except Exception:
         return None, None
+
+
+def fetch_eth_usd():
+    """Best-effort ETH/USD from Blockscout's stats endpoint — one request per
+    tick, shared by every position row. None just drops the $ figures from the
+    card; no exit rule reads it."""
+    url = "https://robinhoodchain.blockscout.com/api/v2/stats"
+    try:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            d = json.load(resp)
+        return float(d["coin_price"])
+    except Exception:
+        return None
 
 
 def trailing_floor_pct(peak):
@@ -170,25 +199,30 @@ def journal_close(rec):
         print(f"warn: could not journal close: {e}")
 
 
-def sweep_stranded():
+def sweep_stranded(proto, executor):
     """Retry the exit sell for bags a close could not unload.
 
-    Runs every tick, before the position pass. A pool that was dead when we
-    closed can be re-seeded by another LP, and a sell that reverted on a
-    transient just works next time — so the bag is worth re-offering cheaply and
-    often. No-op (one RPC read) when nothing is stranded.
+    Runs every tick, before the position pass, once per executor (the two keep
+    separate stranded journals). A pool that was dead when we closed can be
+    re-seeded by another LP, and a sell that reverted on a transient just works
+    next time — so the bag is worth re-offering cheaply and often. No-op (one
+    RPC read) when nothing is stranded.
     """
-    out, err = run_executor(["sweep"], close_auth=True)
+    out, err = run_executor(executor, ["sweep"], close_auth=True)
     if err or not out:
         if err:
-            print(f"monitor: sweep failed: {err}")
+            print(f"monitor: {proto} sweep failed: {err}")
         return
     if not out.get("swept"):
         return
     for r in out.get("results", []):
-        if r.get("resolved") and r.get("weth_out", "0") != "0":
-            print(f"monitor: SWEPT {r.get('symbol')} -> {r['weth_out']} WETH (fee {r.get('fee')})")
-            alert(f"🧹 Robinhood sweep recovered {r['weth_out']} WETH\n"
+        # v3 reports weth_out; v4 reports quote_out + quote_symbol (the quote
+        # varies per pool there).
+        recovered = r.get("quote_out", r.get("weth_out", "0"))
+        unit = r.get("quote_symbol", "WETH")
+        if r.get("resolved") and recovered != "0":
+            print(f"monitor: SWEPT {r.get('symbol')} -> {recovered} {unit} (fee {r.get('fee')})")
+            alert(f"🧹 Robinhood sweep recovered {recovered} {unit}\n"
                   f"sold stranded {r.get('symbol')} ({r.get('token')})")
         elif r.get("resolved") is False:
             print(f"monitor: still stranded {r.get('symbol')} "
@@ -217,10 +251,22 @@ def render_card(rows):
         lines.append("\nNo active positions. Bot is idle.")
     for r in rows:
         pnl = f"{r['pnl_pct']:+.1f}%" if r["pnl_pct"] is not None else "n/a"
+        if r.get("pnl_usd") is not None:
+            pnl += f" (${r['pnl_usd']:+.2f})"
         val = r["value_weth"]
         ent = r["entry_weth"]
-        val_s = f"{val:.5f}" if val is not None else "?"
-        ent_s = f"{ent:.5f}" if ent is not None else "?"
+        qsym = r.get("quote_symbol") or "WETH"
+        # USDG values ARE dollars — two decimals, no ETH/USD conversion.
+        if qsym == "USDG":
+            val_s = f"{val:.2f}" if val is not None else "?"
+            ent_s = f"{ent:.2f}" if ent is not None else "?"
+            usd_s = ""
+        else:
+            val_s = f"{val:.5f}" if val is not None else "?"
+            ent_s = f"{ent:.5f}" if ent is not None else "?"
+            usd = r.get("eth_usd")
+            usd_s = (f" (${val * usd:.2f} / ${ent * usd:.2f})"
+                     if usd and val is not None and ent is not None else "")
         age_min = r["age_min"]
         if age_min is None:
             age = "n/a"
@@ -244,13 +290,13 @@ def render_card(rows):
             "",
             "---",
             "",
-            f"### Position #{r['tokenId']}",
-            f"`{r['pool']}`" if r.get("pool") else "`?`",
+            f"### {r.get('pair') or 'Position #' + r['tokenId']}",
+            (f"`{r['pool']}`" if r.get("pool") else "`?`") + f" · #{r['tokenId']}",
             "",
             "| Metric | Value |",
             "|--------|-------|",
             f"| PnL | {pnl} · peak {r['peak_pct']:+.1f}% |",
-            f"| Value | {val_s} / {ent_s} WETH |",
+            f"| Value | {val_s} / {ent_s} {qsym}{usd_s} |",
             f"| Range | {rng} · age {age} |",
             f"| Price 5m/1h | {m5} / {h1} |",
         ] + [f"- {w}" for w in warnings] + [
@@ -260,26 +306,46 @@ def render_card(rows):
     return "\n".join(lines)
 
 
+def state_key(proto, tid):
+    """Peak/oor state key. v3 keys are bare tokenIds (the live state file
+    predates v4 and must keep matching); v4 is namespaced because the two
+    PositionManagers mint colliding tokenId sequences."""
+    return str(tid) if proto == "v3" else f"{proto}:{tid}"
+
+
 def main():
-    pos, err = run_executor(["positions"])
-    if err:
+    # Gather (proto, executor, tokenId) across executors. One executor's read
+    # failure must not blind the monitor to the other's positions — note it,
+    # keep scanning, and only fail the tick when EVERY read failed.
+    work = []
+    errors = []
+    for proto, executor in EXECUTORS:
+        pos, err = run_executor(executor, ["positions"])
+        if err:
+            errors.append(f"{proto}: {err}")
+            print(f"monitor: {proto} positions read failed: {err}")
+            continue
+        # Stranded bags outlive the positions that created them, so sweep
+        # BEFORE the no-open-positions early return below — the venue sits
+        # flat most of the time, and a sweep that only ran when something was
+        # open would never run. Each executor keeps its own stranded journal.
+        if not REPORT_ONLY and not DRY_RUN:
+            sweep_stranded(proto, executor)
+        for p in pos.get("positions", []):
+            work.append((proto, executor, p["tokenId"]))
+    if errors and len(errors) == len(EXECUTORS):
         # Report-only must still hand the cron a parseable line so it can decide
         # SILENT vs surface-the-error, instead of leaving the agent to guess.
         if REPORT_ONLY:
-            print("MONITOR_REPORT:" + json.dumps({"positions": [], "error": err}))
-            sys.exit(1)
-        print(f"monitor: positions read failed: {err}")
+            print("MONITOR_REPORT:" + json.dumps({"positions": [], "error": "; ".join(errors)}))
         sys.exit(1)
-    # Stranded bags outlive the positions that created them, so sweep BEFORE the
-    # no-open-positions early return below — the venue sits flat most of the
-    # time, and a sweep that only ran when something was open would never run.
-    if not REPORT_ONLY and not DRY_RUN:
-        sweep_stranded()
 
-    ids = [p["tokenId"] for p in pos.get("positions", [])]
-    if not ids:
+    if not work:
         if REPORT_ONLY:
-            print("MONITOR_REPORT:" + json.dumps({"positions": []}))
+            report = {"positions": []}
+            if errors:
+                report["error"] = "; ".join(errors)
+            print("MONITOR_REPORT:" + json.dumps(report))
             return
         print("monitor: no open positions")
         return
@@ -287,19 +353,21 @@ def main():
     if REPORT_ONLY:
         state = load_state()
         now = time.time()
+        eth_usd = fetch_eth_usd()
         rows = []
-        for tid in ids:
-            s, serr = run_executor(["state", "--id", str(tid)])
+        for proto, executor, tid in work:
+            s, serr = run_executor(executor, ["state", "--id", str(tid)])
             if serr or not s:
-                print(f"monitor: state #{tid} failed: {serr}")
+                print(f"monitor: {proto} state #{tid} failed: {serr}")
                 continue
             pnl = s.get("pnlPct")
             in_range = bool(s.get("inRange"))
             age_min = s.get("ageMin")
             pool = s.get("pool")
+            qsym = s.get("quoteSymbol") or "WETH"
             # Read persisted peak/oor without mutating — the systemd loop owns
             # writes to STATE_PATH; the report reflects its last tick.
-            ps = state.get(str(tid), {"peak_pnl": 0.0, "oor_since": None})
+            ps = state.get(state_key(proto, tid), {"peak_pnl": 0.0, "oor_since": None})
             peak = ps.get("peak_pnl", 0.0)
             if pnl is not None and pnl > peak:
                 peak = pnl
@@ -309,37 +377,54 @@ def main():
                 oor_min = (now - ps["oor_since"]) / 60.0
             m5, h1 = fetch_momentum(pool) if pool else (None, None)
             reason = decide(pnl, peak, in_range, age_min, oor_min, m5, h1)
+            val_w, ent_w = s.get("valueWeth"), s.get("entryWeth")
+            # USDG positions are dollar-quoted already; everything else is
+            # ETH-quoted and needs the ETH/USD conversion.
+            if val_w is None or ent_w is None:
+                pnl_usd = None
+            elif qsym == "USDG":
+                pnl_usd = round(val_w - ent_w, 2)
+            else:
+                pnl_usd = round((val_w - ent_w) * eth_usd, 2) if eth_usd else None
             rows.append({
-                "tokenId": str(tid), "pool": pool,
+                "tokenId": str(tid), "protocol": proto, "pool": pool, "pair": s.get("pair"),
+                "quote_symbol": qsym,
                 "pnl_pct": round(pnl, 2) if pnl is not None else None,
+                "pnl_usd": pnl_usd, "eth_usd": eth_usd,
                 "peak_pct": round(peak, 2), "in_range": in_range,
                 "oor_min": round(oor_min, 1), "age_min": round(age_min, 1) if age_min is not None else None,
                 "m5": m5, "h1": h1,
-                "value_weth": s.get("valueWeth"), "entry_weth": s.get("entryWeth"),
+                "value_weth": val_w, "entry_weth": ent_w,
                 "decision": "CLOSE" if reason else "HOLD",
                 "reason": reason or "healthy — held by monitor loop",
             })
+        report = {"positions": rows}
+        if errors:
+            report["error"] = "; ".join(errors)
         print(render_card(rows))
-        print("MONITOR_REPORT:" + json.dumps({"positions": rows}))
+        print("MONITOR_REPORT:" + json.dumps(report))
         return
 
     state = load_state()
     now = time.time()
     live = set()
 
-    for tid in ids:
-        live.add(str(tid))
-        s, err = run_executor(["state", "--id", str(tid)])
+    for proto, executor, tid in work:
+        skey = state_key(proto, tid)
+        live.add(skey)
+        s, err = run_executor(executor, ["state", "--id", str(tid)])
         if err or not s:
-            print(f"monitor: state #{tid} failed: {err}")
+            print(f"monitor: {proto} state #{tid} failed: {err}")
             continue
 
         pnl = s.get("pnlPct")
         in_range = bool(s.get("inRange"))
         age_min = s.get("ageMin")
         pool = s.get("pool")
+        pair = s.get("pair") or f"#{tid}"
+        qsym = s.get("quoteSymbol") or "WETH"
 
-        ps = state.setdefault(str(tid), {"peak_pnl": 0.0, "oor_since": None})
+        ps = state.setdefault(skey, {"peak_pnl": 0.0, "oor_since": None})
         if pnl is not None and pnl > ps["peak_pnl"]:
             ps["peak_pnl"] = pnl
         peak = ps["peak_pnl"]
@@ -356,7 +441,7 @@ def main():
         reason = decide(pnl, peak, in_range, age_min, oor_min, m5, h1)
 
         pnl_str = f"{pnl:.1f}%" if pnl is not None else "n/a"
-        print(f"monitor: #{tid} pnl={pnl_str} peak={peak:.1f}% "
+        print(f"monitor: {proto} #{tid} pnl={pnl_str} peak={peak:.1f}% "
               f"{'in' if in_range else 'OUT'}range oor={oor_min:.0f}m "
               f"m5={m5} h1={h1} -> {reason or 'HOLD'}")
 
@@ -364,10 +449,10 @@ def main():
             continue
 
         if DRY_RUN:
-            print(f"monitor: [dry-run] would close #{tid}: {reason}")
+            print(f"monitor: [dry-run] would close {proto} #{tid}: {reason}")
             continue
 
-        out, cerr = run_executor(["close", "--id", str(tid)], close_auth=True)
+        out, cerr = run_executor(executor, ["close", "--id", str(tid)], close_auth=True)
         closed = out and out.get("success")
         # A close can succeed while its token->WETH sell fails (rugged pool,
         # sell tax): the liquidity is out and the NFT burned, but the token side
@@ -378,33 +463,42 @@ def main():
         journal_close({
             "ts": int(now),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "tokenId": str(tid), "pool": pool,
+            "tokenId": str(tid), "protocol": proto, "pool": pool,
             "pnl_pct": round(pnl, 4) if pnl is not None else None,
             "peak_pct": round(peak, 4), "age_min": round(age_min, 1) if age_min else None,
             "reason": reason, "success": bool(closed), "dry_run": False,
             "swapped_out": bool((out or {}).get("swapped_out")),
+            # weth_out is the v4 executor's alias for quote_out, so this stays
+            # populated on both protocols; quote_symbol says what unit it is.
             "weth_out": (out or {}).get("weth_out"),
+            "quote_symbol": (out or {}).get("quote_symbol", qsym),
             "stranded": stranded,
         })
         if closed:
-            state.pop(str(tid), None)
-            live.discard(str(tid))
-            msg = f"🔴 Robinhood LP closed #{tid}\n{reason}\npnl {pnl_str} peak {peak:.1f}%"
+            state.pop(skey, None)
+            live.discard(skey)
+            msg = f"🔴 Robinhood LP closed {pair} (#{tid})\n{reason}\npnl {pnl_str} peak {peak:.1f}%"
             if stranded:
                 msg += (f"\n⚠️ {stranded.get('symbol', '?')} NOT sold — {stranded.get('reason', '?')}"
                         f"\ntoken {stranded.get('token')}\nqueued for sweep")
             else:
-                msg += f"\nsold for {(out or {}).get('weth_out', '?')} WETH"
+                msg += (f"\nsold for {(out or {}).get('weth_out', '?')} "
+                        f"{(out or {}).get('quote_symbol', qsym)}")
             alert(msg)
-            print(f"monitor: CLOSED #{tid}: {reason}"
+            print(f"monitor: CLOSED {proto} #{tid}: {reason}"
                   + (f" [STRANDED {stranded.get('symbol')}]" if stranded else ""))
         else:
-            print(f"monitor: CLOSE FAILED #{tid}: {cerr}")
+            print(f"monitor: CLOSE FAILED {proto} #{tid}: {cerr}")
 
-    # Drop peak/oor state for positions no longer open (closed elsewhere).
-    for tid in list(state.keys()):
-        if tid not in live:
-            state.pop(tid, None)
+    # Drop peak/oor state for positions no longer open (closed elsewhere) —
+    # but never for an executor whose positions read failed this tick: its
+    # positions are missing from `live` because we couldn't see them, not
+    # because they closed, and pruning would reset their peaks to zero.
+    failed = {e.split(":", 1)[0] for e in errors}
+    for key in list(state.keys()):
+        proto = key.split(":", 1)[0] if ":" in key else "v3"
+        if key not in live and proto not in failed:
+            state.pop(key, None)
     save_state(state)
 
 
