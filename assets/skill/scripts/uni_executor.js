@@ -7,6 +7,7 @@
 //   node uni_executor.js address                       # derived EVM address (fund this)
 //   node uni_executor.js balance                       # ETH + WETH balances
 //   node uni_executor.js wrap --amount 0.05            # ETH -> WETH
+//   node uni_executor.js unwrap [--amount 0.001]       # WETH -> ETH (bare: refill gas reserve)
 //   node uni_executor.js quote --pool 0x..             # pool state (tick, price, fee)
 //   node uni_executor.js deploy --pool 0x.. --amount 0.01 [--strategy balanced_tight|weth_below] [--range-pct 10] [--slippage 5]
 //   node uni_executor.js positions                     # owned NPM positions
@@ -19,6 +20,10 @@
 // as the secp256k1 scalar so one funded identity serves both venues until a
 // dedicated EVM key exists). ROBINHOOD_RPC_URL optional. DRY_RUN=true skips
 // every send and prints the 🧪 DRY RUN DEPLOY marker instead of 🚀 DEPLOYED.
+//
+// Optional tuning: UNI_GAS_FLOOR_ETH / UNI_GAS_TARGET_ETH (auto-unwrap gas
+// reserve), UNI_EXIT_SLIPPAGE_PCT (exit-sell slippage floor),
+// UNI_STRANDED_MAX_BACKOFF_S (sweep retry cap).
 
 const bs58 = require("bs58");
 const dotenv = require("dotenv");
@@ -58,6 +63,17 @@ const FEE_TIERS = [100, 500, 3000, 10000];
 // Slippage floor for the exit sell. Wide on purpose — the alternative to a bad
 // fill on a dumping memecoin is no fill, and no fill means the bag rots.
 const EXIT_SLIPPAGE_PCT = parseFloat(process.env.UNI_EXIT_SLIPPAGE_PCT || "15");
+
+// Gas floor. Every tx here is paid in native ETH, but every asset the bot holds
+// is WETH — so the wallet can be solvent and still unable to close a position,
+// which is exactly the moment being stuck costs the most. The executor tops
+// itself up from WETH before any state-changing command instead of waiting for
+// the operator to unwrap by hand. A full close+sell runs ~0.000035 ETH at the
+// chain's ~0.05 gwei, so the default floor is ~8 closes of headroom and the
+// target ~23 — small enough that the reserve never meaningfully competes with
+// trading capital. Top-ups take only what's needed to reach the target.
+const GAS_FLOOR_WEI = parseEther(process.env.UNI_GAS_FLOOR_ETH || "0.0003");
+const GAS_TARGET_WEI = parseEther(process.env.UNI_GAS_TARGET_ETH || "0.0008");
 
 // Position entry journal: uni_monitor.py reads cost basis (WETH deployed) +
 // entry timestamp from here to compute PnL and age, the EVM analog of the
@@ -102,7 +118,10 @@ const routerAbi = parseAbi([
   "function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)",
 ]);
 
-const wethAbi = parseAbi(["function deposit() payable"]);
+const wethAbi = parseAbi([
+  "function deposit() payable",
+  "function withdraw(uint256 wad)",
+]);
 
 const factoryAbi = parseAbi([
   "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)",
@@ -254,6 +273,42 @@ async function send(wallet, req, label) {
   return hash;
 }
 
+// ensureGas unwraps just enough WETH to keep native ETH above GAS_FLOOR_WEI.
+// Called before every state-changing command, so the bot can always pay for its
+// own exit. Never throws: a failed top-up must not abort the close it was meant
+// to enable — the close may still have enough gas to land on its own.
+//
+// The one unrecoverable case is ETH at literal zero, because the unwrap tx
+// itself needs gas. The floor exists to make sure we never get there: it trips
+// while several closes' worth of gas is still in the wallet.
+async function ensureGas(wallet, account) {
+  if (DRY_RUN) return null;
+  const eth = await pub.getBalance({ address: account.address });
+  if (eth >= GAS_FLOOR_WEI) return null;
+
+  const weth = await pub.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
+  if (weth === 0n) {
+    console.error(`warn: gas low (${formatEther(eth)} ETH) and no WETH to unwrap — fund this wallet`);
+    return { low: true, eth: formatEther(eth), unwrapped: "0", reason: "no WETH to unwrap" };
+  }
+  // A floor set above the target would make `need` negative and hand withdraw()
+  // a nonsense amount, so treat the target as at least the floor.
+  const target = GAS_TARGET_WEI > GAS_FLOOR_WEI ? GAS_TARGET_WEI : GAS_FLOOR_WEI;
+  const need = target - eth;
+  if (need <= 0n) return null;
+  const amount = need < weth ? need : weth;
+  try {
+    const tx = await send(wallet, {
+      address: WETH, abi: wethAbi, functionName: "withdraw", args: [amount],
+      account: wallet.account, chain,
+    }, `unwrap ${formatEther(amount)} WETH -> ETH (gas top-up, had ${formatEther(eth)})`);
+    return { low: false, eth_before: formatEther(eth), unwrapped: formatEther(amount), tx };
+  } catch (e) {
+    console.error(`warn: gas top-up failed: ${e.shortMessage || e.message}`);
+    return { low: true, eth: formatEther(eth), unwrapped: "0", reason: e.shortMessage || e.message };
+  }
+}
+
 async function ensureAllowance(wallet, owner, token, spender, amount) {
   const current = await pub.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
   if (current >= amount) return;
@@ -370,6 +425,29 @@ async function cmdWrap(wallet) {
   console.log(JSON.stringify({ success: true, wrapped: formatEther(amount) }));
 }
 
+async function cmdUnwrap(wallet, account) {
+  // --amount unwraps exactly that; bare `unwrap` tops the gas reserve back up
+  // to its target, which is what the monitor and the operator usually want.
+  const raw = arg("amount", "");
+  if (!raw) {
+    const eth = await pub.getBalance({ address: account.address });
+    const weth = await pub.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
+    const need = GAS_TARGET_WEI > eth ? GAS_TARGET_WEI - eth : 0n;
+    const amount = need < weth ? need : weth;
+    if (amount === 0n) {
+      console.log(JSON.stringify({ success: true, unwrapped: "0", note: "gas reserve already at target", eth: formatEther(eth) }));
+      return;
+    }
+    await send(wallet, { address: WETH, abi: wethAbi, functionName: "withdraw", args: [amount], account: wallet.account, chain }, `unwrap ${formatEther(amount)} WETH`);
+    console.log(JSON.stringify({ success: true, unwrapped: formatEther(amount), eth_before: formatEther(eth) }));
+    return;
+  }
+  const amount = parseEther(raw);
+  if (amount <= 0n) throw new Error("--amount must be > 0 (WETH)");
+  await send(wallet, { address: WETH, abi: wethAbi, functionName: "withdraw", args: [amount], account: wallet.account, chain }, `unwrap ${formatEther(amount)} WETH`);
+  console.log(JSON.stringify({ success: true, unwrapped: formatEther(amount) }));
+}
+
 async function cmdQuote() {
   const pool = getAddress(arg("pool", ""));
   const st = await poolState(pool);
@@ -392,6 +470,10 @@ async function cmdDeploy(wallet, account) {
   const rangePct = parseFloat(arg("range-pct", "10"));
   const slippagePct = parseFloat(arg("slippage", "5"));
   if (amountWeth <= 0n) throw new Error("--amount required (WETH)");
+
+  // Top up gas BEFORE minting: an entry that spends the wallet down to no ETH
+  // leaves the position with no way to pay for its own exit.
+  await ensureGas(wallet, account);
 
   const st = await poolState(pool);
   if (st.token0 !== WETH && st.token1 !== WETH) throw new Error("pool has no WETH side");
@@ -555,6 +637,7 @@ async function cmdPositions(account) {
 async function cmdCollect(wallet, account) {
   const id = BigInt(arg("id", "0"));
   if (id <= 0n) throw new Error("--id required");
+  await ensureGas(wallet, account);
   await send(wallet, {
     address: NPM, abi: npmAbi, functionName: "collect",
     args: [{ tokenId: id, recipient: account.address, amount0Max: maxUint128, amount1Max: maxUint128 }],
@@ -574,6 +657,10 @@ async function cmdClose(wallet, account) {
   if (!DRY_RUN && process.env.UNI_CLOSE_AUTH !== "1" && !hasFlag("force")) {
     throw new Error("close requires UNI_CLOSE_AUTH=1 (monitor) or --force (manual)");
   }
+  // A close is the one command that must never fail for want of gas — it is how
+  // a losing position stops losing. Top up first, from the WETH the wallet is
+  // already holding.
+  const gasTopup = await ensureGas(wallet, account);
   const p = await pub.readContract({ address: NPM, abi: npmAbi, functionName: "positions", args: [id] });
   const [token0, token1, liquidity] = [getAddress(p[2]), getAddress(p[3]), p[7]];
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 120);
@@ -629,6 +716,7 @@ async function cmdClose(wallet, account) {
     swapped_out: !!sold,
     weth_out: sold ? sold.weth_out : "0",
     stranded,
+    gas_topup: gasTopup,
   }));
 }
 
@@ -638,6 +726,9 @@ async function cmdClose(wallet, account) {
 async function cmdSweep(wallet, account) {
   const only = arg("token", "");
   let bags = openStranded();
+  // Cheap when there is nothing to sell: skip the gas preflight's two RPC reads
+  // on the empty path, which is most ticks.
+  if (bags.length || only) await ensureGas(wallet, account);
   if (only) {
     const t = getAddress(only);
     const known = bags.find((b) => getAddress(b.token) === t);
@@ -715,8 +806,9 @@ async function main() {
     case "collect": return cmdCollect(wallet, account);
     case "close": return cmdClose(wallet, account);
     case "sweep": return cmdSweep(wallet, account);
+    case "unwrap": return cmdUnwrap(wallet, account);
     default:
-      console.error("usage: uni_executor.js address|balance|wrap|quote|deploy|positions|state|collect|close|sweep [--flags]");
+      console.error("usage: uni_executor.js address|balance|wrap|unwrap|quote|deploy|positions|state|collect|close|sweep [--flags]");
       process.exit(2);
   }
 }
