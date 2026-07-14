@@ -179,7 +179,12 @@ func Deployed(out string) bool {
 
 // Summarize condenses executor stdout into a short report line.
 func Summarize(out string) string {
-	for _, marker := range []string{"🚀 DEPLOYED", "🧪 DRY RUN DEPLOY"} {
+	// "❌ DEPLOY FAILED" is the executor's own marker for a mint that reverted
+	// without opening anything — a two-sided strategy whose fill came back
+	// one-sided — and whose swap leg it has already sold back to WETH. That exits
+	// 0 because nothing is broken, so it needs a marker of its own; without one
+	// the fallback below would report its raw JSON result line.
+	for _, marker := range []string{"🚀 DEPLOYED", "🧪 DRY RUN DEPLOY", "❌ DEPLOY FAILED"} {
 		if i := strings.Index(out, marker); i >= 0 {
 			// Only the marker line — the executor prints a raw JSON result line
 			// right after it, which must not leak into the Telegram report.

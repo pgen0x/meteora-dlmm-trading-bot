@@ -2,6 +2,7 @@ package robinhood
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -124,5 +125,26 @@ func TestLastLineStripsLogNoise(t *testing.T) {
 	}
 	if got := lastLine("  single line  "); got != "single line" {
 		t.Fatalf("lastLine single-line = %q", got)
+	}
+}
+
+// A mint that reverts without opening a position exits 0 (the executor sells the
+// swap leg back to WETH and reports it), so Summarize must recognise its marker
+// line instead of falling through and reporting the raw JSON result line.
+func TestSummarizeReportsFailedDeployInWords(t *testing.T) {
+	out := "swap 0.0015 WETH -> token: 0xabc\n" +
+		"mint failed (no position opened): Price slippage check\n" +
+		"❌ DEPLOY FAILED (no position opened): Price slippage check, refunded 0.00148 WETH\n" +
+		`{"success":false,"error":"mint failed: Price slippage check","pool":"0xdead"}`
+
+	got := Summarize(out)
+	if strings.Contains(got, "{") {
+		t.Fatalf("Summarize leaked the JSON result line: %q", got)
+	}
+	if !strings.Contains(got, "DEPLOY FAILED") || !strings.Contains(got, "refunded 0.00148 WETH") {
+		t.Fatalf("Summarize dropped the failure detail: %q", got)
+	}
+	if Deployed(out) {
+		t.Fatal("Deployed() must be false when no position was opened")
 	}
 }

@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const {
   createPublicClient, createWalletClient, http, parseEther, formatEther,
-  getAddress, erc20Abi, parseAbi, maxUint128,
+  getAddress, erc20Abi, parseAbi, parseEventLogs, maxUint128,
 } = require("viem");
 const { privateKeyToAccount } = require("viem/accounts");
 
@@ -54,6 +54,14 @@ const NPM = getAddress("0x73991a25c818bf1f1128deaab1492d45638de0d3");
 const ROUTER = getAddress("0xcaf681a66d020601342297493863e78c959e5cb2");
 const FACTORY = getAddress("0x1f7d7550b1b028f7571e69a784071f0205fd2efa");
 const ZERO = "0x0000000000000000000000000000000000000000";
+
+// Minimum share of each offered side a two-sided mint must actually consume.
+// A v3 mint whose range no longer straddles the tick takes ONE token and
+// refunds the other without reverting — the failure mode that made every
+// balanced_tight entry a dead out-of-range position. Passing this as
+// amount0Min/amount1Min turns that silent half-fill into a revert we can
+// unwind, while still tolerating the ratio drift a live tick causes.
+const MIN_FILL_PCT = parseFloat(process.env.UNI_MIN_FILL_PCT || "25");
 
 // Every Uniswap v3 fee tier. The exit sell walks all of them, not just the
 // tier of the pool we LP'd: a launch pool's liquidity can be pulled out from
@@ -110,6 +118,9 @@ const npmAbi = parseAbi([
   "function balanceOf(address owner) view returns (uint256)",
   "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
   "function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) payable returns (uint256 amount0, uint256 amount1)",
+  // Emitted by mint(): the amounts the position ACTUALLY took, which is the only
+  // honest cost basis — the rest of what we offered is refunded to the wallet.
+  "event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)",
   "function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) payable returns (uint256 amount0, uint256 amount1)",
   "function burn(uint256 tokenId) payable",
 ]);
@@ -484,15 +495,27 @@ async function cmdDeploy(wallet, account) {
   const bandTicks = Math.max(pctToTicks(rangePct), spacing);
 
   let tickLower, tickUpper, amount0 = 0n, amount1 = 0n, swapped = 0n;
+  // Pool state the band is built from and the cost basis is priced at.
+  // balanced_tight replaces it with a post-swap read; weth_below never swaps.
+  let mintSt = st;
 
   if (strategy === "balanced_tight") {
-    // Two-sided +/- rangePct around the current tick; half the WETH is
-    // swapped into the token so both sides carry inventory.
-    tickLower = roundToSpacing(tick - bandTicks, spacing, false);
-    tickUpper = roundToSpacing(tick + bandTicks, spacing, true);
+    // Two-sided +/- rangePct band, half the WETH swapped into the token so both
+    // sides carry inventory.
+    //
+    // The swap goes FIRST and the band is centered on the tick it leaves behind,
+    // because by mint time the tick read at the top of this function is stale on
+    // two counts: our own buy moves a thin launch pool, and other traders move it
+    // while our swap is in flight. #111130 (2026-07-14) centered a +/-953-tick
+    // band on tick ~168150 and minted at 166042 — 2108 ticks away, of which our
+    // 0.0015 WETH buy was 783 (-7.5%) and 18 seconds of market dump was the rest.
+    // A range that no longer straddles the tick makes the mint take one token and
+    // refund the other, so the position was born out-of-range earning no fees.
     const half = amountWeth / 2n;
     const spotOut = spotOutFor(half, st.sqrtPriceX96, wethIs0);
     const minOut = (spotOut * BigInt(Math.floor((100 - slippagePct) * 100))) / 10000n;
+    const balBefore = DRY_RUN ? 0n
+      : await pub.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
     await ensureAllowance(wallet, account.address, WETH, ROUTER, half);
     await send(wallet, {
       address: ROUTER, abi: routerAbi, functionName: "exactInputSingle",
@@ -500,7 +523,20 @@ async function cmdDeploy(wallet, account) {
       account: wallet.account, chain,
     }, `swap ${formatEther(half)} WETH -> token`);
     swapped = half;
-    const tokenBal = DRY_RUN ? spotOut : await pub.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
+
+    if (!DRY_RUN) mintSt = await poolState(pool);
+    const midTick = Number(mintSt.tick);
+    const movedPct = (Math.pow(1.0001, midTick - tick) - 1) * 100;
+    console.log(`entry impact: tick ${tick} -> ${midTick} (${movedPct >= 0 ? "+" : ""}${movedPct.toFixed(2)}% price) — band +/-${bandTicks} ticks around ${midTick}`);
+    tickLower = roundToSpacing(midTick - bandTicks, spacing, false);
+    tickUpper = roundToSpacing(midTick + bandTicks, spacing, true);
+
+    // Only the tokens THIS swap bought are inventory. A leftover bag of the same
+    // token from an earlier stranded exit is not ours to LP, and counting it
+    // would inflate the cost basis with capital already written off.
+    const balAfter = DRY_RUN ? spotOut
+      : await pub.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
+    const tokenBal = balAfter - balBefore;
     if (wethIs0) { amount0 = amountWeth - half; amount1 = tokenBal; }
     else { amount0 = tokenBal; amount1 = amountWeth - half; }
   } else if (strategy === "weth_below") {
@@ -526,14 +562,18 @@ async function cmdDeploy(wallet, account) {
   if (swapped > 0n) await ensureAllowance(wallet, account.address, token, NPM, wethIs0 ? amount1 : amount0);
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 120);
+  // A two-sided strategy demands a two-sided fill: each side must take at least
+  // MIN_FILL_PCT of what we offered, or the mint reverts and the funds stay in
+  // the wallet where `sellTokenForWeth` below can put them back into WETH. A
+  // one-sided strategy has a zero side by construction, so its mins stay 0.
+  const twoSided = strategy === "balanced_tight";
+  const minFill = (x) => (x * BigInt(Math.floor(MIN_FILL_PCT * 100))) / 10000n;
   const mintArgs = {
-    token0: st.token0, token1: st.token1, fee: st.fee,
+    token0: mintSt.token0, token1: mintSt.token1, fee: mintSt.fee,
     tickLower, tickUpper,
     amount0Desired: amount0, amount1Desired: amount1,
-    // Min amounts stay 0: mint pulls at spot with no price impact, the swap
-    // leg above already carries the slippage guard, and leftovers stay in
-    // the wallet rather than reverting a tight-band mint on tick drift.
-    amount0Min: 0n, amount1Min: 0n,
+    amount0Min: twoSided ? minFill(amount0) : 0n,
+    amount1Min: twoSided ? minFill(amount1) : 0n,
     recipient: account.address, deadline,
   };
 
@@ -542,9 +582,51 @@ async function cmdDeploy(wallet, account) {
     console.log(JSON.stringify({ success: true, dryRun: true, pool, strategy, tickLower, tickUpper }));
     return;
   }
-  const hash = await wallet.writeContract({ address: NPM, abi: npmAbi, functionName: "mint", args: [mintArgs], account: wallet.account, chain });
-  const rcpt = await pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
-  if (rcpt.status !== "success") throw new Error(`mint reverted: ${hash}`);
+  let hash, rcpt;
+  try {
+    hash = await wallet.writeContract({ address: NPM, abi: npmAbi, functionName: "mint", args: [mintArgs], account: wallet.account, chain });
+    rcpt = await pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
+    if (rcpt.status !== "success") throw new Error(`mint reverted: ${hash}`);
+  } catch (e) {
+    // The mint never landed, so no position exists and the only capital at risk
+    // is the token half we swapped into. Put it back into WETH rather than leave
+    // an unmanaged bag the monitor knows nothing about; if even that fails, hand
+    // it to the stranded journal so `sweep` keeps retrying.
+    const reason = (e.shortMessage || e.message || "mint failed").split("\n")[0];
+    console.error(`mint failed (no position opened): ${reason}`);
+    let refund = null;
+    if (swapped > 0n) {
+      const bal = await pub.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [account.address] });
+      const sym = await pub.readContract({ address: token, abi: erc20Abi, functionName: "symbol" }).catch(() => "?");
+      const r = await sellTokenForWeth(wallet, account, token, bal, Number(mintSt.fee));
+      if (r.ok) {
+        refund = { symbol: sym, weth_out: formatEther(r.amountOut), tx: r.tx };
+        console.log(`refunded swap leg: sold ${sym} back for ${formatEther(r.amountOut)} WETH`);
+      } else {
+        refund = { symbol: sym, failed: r.reason };
+        journalStranded({
+          ts: Math.floor(Date.now() / 1000),
+          timestamp: new Date().toISOString(),
+          tokenId: null, token, symbol: sym, amount: bal.toString(),
+          reason: r.reason, resolved: false,
+          attempts: 1, next_try: Math.floor(Date.now() / 1000) + retryDelay(1),
+        });
+        console.error(`warn: could not refund ${sym} swap leg (${r.reason}) — queued for sweep`);
+      }
+    }
+    // Marker line for internal/robinhood.Summarize — a clean "we opened nothing
+    // and put the money back" is a real outcome, not a crash, and the operator's
+    // report should say so in words instead of leaking the JSON result line.
+    const refundNote = refund
+      ? (refund.weth_out ? `, refunded ${refund.weth_out} WETH` : `, ${refund.symbol} REFUND FAILED (${refund.failed}) — queued for sweep`)
+      : "";
+    console.log(`❌ DEPLOY FAILED (no position opened): ${reason}${refundNote}`);
+    console.log(JSON.stringify({
+      success: false, error: `mint failed: ${reason}`,
+      pool, strategy, tickLower, tickUpper, refund,
+    }));
+    return;
+  }
   // Resolve tokenId from two independent sources; never journal "unknown" — an
   // orphaned entry disables the monitor's SL/TP for that position.
   let tokenId;
@@ -557,15 +639,45 @@ async function cmdDeploy(wallet, account) {
     console.log(JSON.stringify({ success: false, error: "tokenId unresolved", pool, strategy, tickLower, tickUpper, tx: hash, wethIn: formatEther(amountWeth) }));
     return;
   }
-  // Cost basis = the full WETH committed this deploy (balanced_tight swapped
-  // half into the token; both legs are still WETH-denominated capital).
+  // Cost basis = what the position ACTUALLY took, read from the mint's own
+  // IncreaseLiquidity event, priced in WETH at the tick we minted at.
+  //
+  // It used to be the full WETH committed. But a mint only pulls the ratio its
+  // range needs and refunds the rest to the wallet, so cmdState — which values
+  // the position alone — measured a shrunken position against the whole commit
+  // and reported a double-digit loss the instant the position opened. That is
+  // enough to trip the monitor's emergency stop-loss, which deliberately
+  // bypasses the age grace, so every position was closed within a tick or two of
+  // being born (#106405/#106446/#111130, all "emergency SL" under 2 minutes old,
+  // none ever reaching a positive peak). The refunded leftovers are still ours —
+  // they sit in the wallet and cmdClose sells them out — so they belong nowhere
+  // in this position's PnL.
+  const inc = parseEventLogs({ abi: npmAbi, eventName: "IncreaseLiquidity", logs: rcpt.logs })
+    .find((l) => l.args.tokenId.toString() === String(tokenId));
+  if (!inc) {
+    // Should not happen — NPM.mint always emits it — but falling back to the
+    // full commit would resurrect the instant-stop-loss bug, so say so loudly.
+    console.error("warn: no IncreaseLiquidity event in mint receipt — cost basis falls back to the full commit, which will overstate the loss");
+  }
+  const used0 = inc ? inc.args.amount0 : amount0;
+  const used1 = inc ? inc.args.amount1 : amount1;
+  const entryWeth = valueInWeth(used0, used1, mintSt.sqrtPriceX96, wethIs0);
+  const idleWeth = amountWeth - entryWeth;
   journalEntry({
     tokenId, pool, token0: st.token0, token1: st.token1, fee: Number(st.fee),
-    tickLower, tickUpper, wethIn: formatEther(amountWeth), strategy,
+    tickLower, tickUpper, wethIn: formatEther(entryWeth), strategy,
+    committedWeth: formatEther(amountWeth),
+    used0: used0.toString(), used1: used1.toString(),
     ts: Math.floor(Date.now() / 1000),
   });
+  const inRange = Number(mintSt.tick) >= tickLower && Number(mintSt.tick) < tickUpper;
+  console.log(`position value ${formatEther(entryWeth)} WETH of ${formatEther(amountWeth)} committed `
+    + `(${formatEther(idleWeth)} left in wallet), ${inRange ? "IN range" : "OUT OF range"} at tick ${mintSt.tick}`);
   console.log(`🚀 DEPLOYED pool=${pool} strategy=${strategy} position=${tokenId} tx=${hash}`);
-  console.log(JSON.stringify({ success: true, pool, strategy, tokenId, tickLower, tickUpper, tx: hash }));
+  console.log(JSON.stringify({
+    success: true, pool, strategy, tokenId, tickLower, tickUpper, tx: hash,
+    wethIn: formatEther(entryWeth), committedWeth: formatEther(amountWeth), inRange,
+  }));
 }
 
 // cmdState prices one position for the monitor: current WETH value, PnL vs
