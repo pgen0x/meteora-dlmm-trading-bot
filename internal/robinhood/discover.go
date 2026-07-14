@@ -46,8 +46,9 @@ var cycleCount int
 var discoverClient = &http.Client{Timeout: 15 * time.Second}
 
 // feePctRe captures a trailing fee-tier suffix in a GeckoTerminal pool name,
-// e.g. "CALLIE / WETH 0.3%" or "USDG / XIAO 87%" (v4 pools can carry odd
-// tiers; the dex filter removes those before the value matters).
+// e.g. "CALLIE / WETH 0.3%" or "USDG / XIAO 87%". v4 names often omit the
+// suffix entirely — fillV4Meta overwrites the parse with the gateway's
+// authoritative feeTier for those.
 var feePctRe = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%\s*$`)
 
 // parseFeePct extracts the fee tier percent from a pool name; 0 = unknown.
@@ -101,10 +102,11 @@ func fetchPage(url string) (*gtResponse, error) {
 
 // FetchNewPools queries GeckoTerminal for the venue's pools — newPoolPages
 // pages of new_pools plus one trending_pools page, deduped by address — and
-// returns them decoded and unit-normalized, restricted to Uniswap v3 pools
-// (the only dex the Phase 2 executor will speak; v4 entries carry bytes32
-// pool IDs, not contract addresses). Page errors after the first successful
-// page are tolerated: a partial view still yields a usable cycle.
+// returns them decoded and unit-normalized, restricted to Uniswap v3 and v4
+// pools (v4 entries carry a bytes32 poolId in the address field and get their
+// hook / fee metadata from one extra gateway call — see fillV4Meta). Page
+// errors after the first successful page are tolerated: a partial view still
+// yields a usable cycle.
 func FetchNewPools(baseURL string) ([]Pool, error) {
 	if baseURL == "" {
 		baseURL = DefaultDiscoverURL
@@ -160,8 +162,14 @@ func FetchNewPools(baseURL string) ([]Pool, error) {
 			continue
 		}
 		seen[gp.Attrs.Address] = true
-		if !strings.HasPrefix(gp.Relationships.Dex.Data.ID, "uniswap-v3") {
-			continue
+		var protocol string
+		switch {
+		case strings.HasPrefix(gp.Relationships.Dex.Data.ID, "uniswap-v3"):
+			protocol = "v3"
+		case strings.HasPrefix(gp.Relationships.Dex.Data.ID, "uniswap-v4"):
+			protocol = "v4" // Address is the bytes32 poolId, not a contract
+		default:
+			continue // v2 / bankr / virtuals — no executor will ever speak these
 		}
 		created, err := time.Parse(time.RFC3339, gp.Attrs.PoolCreatedAt)
 		if err != nil {
@@ -171,28 +179,79 @@ func FetchNewPools(baseURL string) ([]Pool, error) {
 		quote := tokens[gp.Relationships.QuoteToken.Data.ID]
 
 		pools = append(pools, Pool{
-			Address:      gp.Attrs.Address,
-			Name:         gp.Attrs.Name,
-			Dex:          gp.Relationships.Dex.Data.ID,
-			CreatedAt:    created,
-			BaseAddress:  base.Attrs.Address,
-			BaseSymbol:   base.Attrs.Symbol,
-			BaseDecimals: base.Attrs.Decimals,
-			QuoteAddress: quote.Attrs.Address,
-			QuoteSymbol:  quote.Attrs.Symbol,
-			FeePct:       parseFeePct(gp.Attrs.Name),
-			ReserveUSD:   pfloat(gp.Attrs.ReserveUSD),
-			FdvUSD:       pfloat(gp.Attrs.FdvUSD),
-			McapUSD:      pfloat(gp.Attrs.MarketCapUSD),
-			VolumeH1USD:  pfloat(gp.Attrs.VolumeUSD.H1),
-			VolumeH24USD: pfloat(gp.Attrs.VolumeUSD.H24),
-			TxH1:         gp.Attrs.Transactions.H1,
-			TxH24:        gp.Attrs.Transactions.H24,
-			ChangeM5Pct:  pfloat(gp.Attrs.PriceChangePct.M5),
-			ChangeH1Pct:  pfloat(gp.Attrs.PriceChangePct.H1),
-			ChangeH6Pct:  pfloat(gp.Attrs.PriceChangePct.H6),
-			ChangeH24Pct: pfloat(gp.Attrs.PriceChangePct.H24),
+			Address:       gp.Attrs.Address,
+			Name:          gp.Attrs.Name,
+			Dex:           gp.Relationships.Dex.Data.ID,
+			Protocol:      protocol,
+			CreatedAt:     created,
+			BaseAddress:   base.Attrs.Address,
+			BaseSymbol:    base.Attrs.Symbol,
+			BaseDecimals:  base.Attrs.Decimals,
+			QuoteAddress:  quote.Attrs.Address,
+			QuoteSymbol:   quote.Attrs.Symbol,
+			QuoteDecimals: quote.Attrs.Decimals,
+			FeePct:        parseFeePct(gp.Attrs.Name),
+			ReserveUSD:    pfloat(gp.Attrs.ReserveUSD),
+			FdvUSD:        pfloat(gp.Attrs.FdvUSD),
+			McapUSD:       pfloat(gp.Attrs.MarketCapUSD),
+			VolumeH1USD:   pfloat(gp.Attrs.VolumeUSD.H1),
+			VolumeH24USD:  pfloat(gp.Attrs.VolumeUSD.H24),
+			TxH1:          gp.Attrs.Transactions.H1,
+			TxH24:         gp.Attrs.Transactions.H24,
+			ChangeM5Pct:   pfloat(gp.Attrs.PriceChangePct.M5),
+			ChangeH1Pct:   pfloat(gp.Attrs.PriceChangePct.H1),
+			ChangeH6Pct:   pfloat(gp.Attrs.PriceChangePct.H6),
+			ChangeH24Pct:  pfloat(gp.Attrs.PriceChangePct.H24),
 		})
 	}
-	return pools, nil
+	return fillV4Meta(pools), nil
+}
+
+// fillV4Meta resolves hook / dynamic-fee / true fee tier for the batch's v4
+// pools with one aliased gateway call (GeckoTerminal carries none of them, and
+// v4 names often omit the fee suffix parseFeePct depends on).
+//
+// Fail-closed per pool: a v4 pool whose meta cannot be resolved this cycle is
+// dropped, because an unverified hook must never pass the hooked-pool gate by
+// looking hookless. This is the venue's second deliberate fail-closed
+// divergence (the first: GMGN positive honeypot detection). Dropped pools are
+// not marked seen, so a live pool retries next cycle.
+func fillV4Meta(pools []Pool) []Pool {
+	var ids []string
+	for _, p := range pools {
+		if p.Protocol == "v4" {
+			ids = append(ids, p.Address)
+		}
+	}
+	if len(ids) == 0 {
+		return pools
+	}
+
+	meta, err := fetchV4Meta(ids)
+	if err != nil {
+		log.Printf("robinhood: v4 meta fetch failed, dropping %d v4 pool(s) this cycle (fail-closed): %v", len(ids), err)
+		meta = map[string]v4Meta{}
+	}
+
+	kept := pools[:0]
+	dropped := 0
+	for _, p := range pools {
+		if p.Protocol != "v4" {
+			kept = append(kept, p)
+			continue
+		}
+		m, ok := meta[strings.ToLower(p.Address)]
+		if !ok {
+			dropped++
+			continue
+		}
+		p.FeePct = m.FeeTier / feeTierDenom
+		p.Hook = hookAddress(m.Hook)
+		p.DynamicFee = m.IsDynamicFee
+		kept = append(kept, p)
+	}
+	if dropped > 0 {
+		log.Printf("robinhood: dropped %d v4 pool(s) with unresolved meta this cycle", dropped)
+	}
+	return kept
 }

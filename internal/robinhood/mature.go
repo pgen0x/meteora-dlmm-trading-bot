@@ -1,10 +1,7 @@
 package robinhood
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -21,13 +18,13 @@ import (
 // the Fresh thesis — see topPoolsFirst.
 const gatewayURL = "https://interface.gateway.uniswap.org/v1/graphql"
 
-// topPoolsFirst caps the gateway page. The number is deliberately larger than
-// the venue needs: `topV3Pools(chain: ROBINHOOD)` returns the ENTIRE indexed
-// universe — 74 pools on 2026-07-14, sorted by TVL descending, bottoming out
-// around $12.6k TVL, with ZERO pools younger than 24h. The gateway is a TVL
-// leaderboard with an indexing lag, not a discovery feed. That is exactly the
-// half of the venue GeckoTerminal is blind to, and exactly why Fresh must keep
-// using new_pools.
+// topPoolsFirst caps the gateway page (100 is also the schema's hard max on
+// `first`). The number is deliberately larger than the venue needs: each
+// leaderboard returns the ENTIRE indexed universe per protocol — 69 v3 and 80
+// v4 pools on 2026-07-14, sorted by TVL descending, with ZERO pools younger
+// than 24h. The gateway is a TVL leaderboard with an indexing lag, not a
+// discovery feed. That is exactly the half of the venue GeckoTerminal is blind
+// to, and exactly why Fresh must keep using new_pools.
 const topPoolsFirst = 100
 
 // maxEnrich bounds the GeckoTerminal enrichment call. GT's /pools/multi/ takes
@@ -60,6 +57,26 @@ const topPoolsQuery = `query TopV3Pools($chain: Chain!, $first: Int!) {
   }
 }`
 
+// topV4PoolsQuery is the v4 sibling. There is no unified topPools query on
+// this schema (verified 2026-07-14: FieldUndefined) — v2/v3/v4 each get their
+// own root field. v4 adds the fields the protocol adds: the bytes32 poolId
+// (pools live inside the singleton PoolManager, so there is no per-pool
+// address), the hook, and the dynamic-fee flag. Native-ETH sides come back
+// with a null token address.
+const topV4PoolsQuery = `query TopV4Pools($chain: Chain!, $first: Int!) {
+  topV4Pools(chain: $chain, first: $first) {
+    poolId
+    createdAtTimestamp
+    feeTier
+    isDynamicFee
+    hook { address }
+    totalLiquidity { value }
+    cumulativeVolume(duration: DAY) { value }
+    token0 { address symbol decimals }
+    token1 { address symbol decimals }
+  }
+}`
+
 // uniToken is one side of a gateway pool.
 type uniToken struct {
 	Address  string `json:"address"`
@@ -73,27 +90,21 @@ type uniAmount struct {
 	Value float64 `json:"value"`
 }
 
-// uniPool is one entry of topV3Pools.
+// uniPool is one entry of topV3Pools or topV4Pools. The v4-only fields
+// (PoolID, IsDynamicFee, Hook) stay zero on v3 entries.
 type uniPool struct {
 	Address            string     `json:"address"`
+	PoolID             string     `json:"poolId"` // v4: bytes32, no pool contract exists
 	CreatedAtTimestamp int64      `json:"createdAtTimestamp"`
 	FeeTier            float64    `json:"feeTier"`
+	IsDynamicFee       bool       `json:"isDynamicFee"`
 	TotalLiquidity     *uniAmount `json:"totalLiquidity"`
 	CumulativeVolume   *uniAmount `json:"cumulativeVolume"`
 	Token0             uniToken   `json:"token0"`
 	Token1             uniToken   `json:"token1"`
-}
-
-// uniResponse is the GraphQL envelope. Errors are per-field and partial: the
-// gateway returns data alongside errors for individual pools, so a non-empty
-// Errors list is logged, not fatal.
-type uniResponse struct {
-	Data struct {
-		TopV3Pools []uniPool `json:"topV3Pools"`
-	} `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
+	Hook               *struct {
+		Address string `json:"address"`
+	} `json:"hook"`
 }
 
 func (a *uniAmount) val() float64 {
@@ -107,39 +118,56 @@ func (a *uniAmount) val() float64 {
 // the Fresh window that are still generating outsized fee/TVL. It is the
 // mature-mode analog of FetchNewPools and returns Pools ready for Screen.
 //
-// Two hops, two HTTP calls per cycle, on purpose:
+// Two hops, three HTTP calls per cycle, on purpose:
 //
-//  1. Uniswap's gateway returns the venue's whole v3 universe with TVL, fee
-//     tier, age and 24h volume — but no h1 flow and no FDV.
+//  1. Uniswap's gateway returns the venue's whole indexed universe — one call
+//     per protocol (v3 + v4, no unified query exists) — with TVL, fee tier,
+//     age, 24h volume and (v4) hook/dynamic-fee flags, but no h1 flow and no
+//     FDV.
 //  2. A LOCAL prefilter (no I/O) cuts that to the pools that could plausibly
 //     pass, then ONE GeckoTerminal /pools/multi/ call fills in the h1
-//     buys/sells/buyers, price-change windows and FDV that Screen gates on.
+//     buys/sells/buyers, price-change windows and FDV that Screen gates on
+//     (GT accepts v4 bytes32 poolIds in the same batch as v3 addresses).
 //
 // The prefilter is what keeps step 2 to a single request; without it this would
 // fan out per-pool and burn the GT budget the Fresh mode depends on.
 func FetchMaturePools(mp ModeParams, now time.Time) ([]Pool, error) {
-	raw, err := fetchTopV3Pools()
-	if err != nil {
-		return nil, err
+	// Two gateway calls, one per protocol — no unified query exists. A v4
+	// failure degrades to a v3-only cycle (logged) rather than blanking the
+	// mode, mirroring discover.go's tolerated partial pages; only both
+	// universes failing is fatal.
+	rawV3, errV3 := fetchTopPools("v3")
+	rawV4, errV4 := fetchTopPools("v4")
+	if errV3 != nil && errV4 != nil {
+		return nil, fmt.Errorf("gateway v3: %v; v4: %v", errV3, errV4)
+	}
+	for proto, err := range map[string]error{"v3": errV3, "v4": errV4} {
+		if err != nil {
+			log.Printf("robinhood: mature %s universe fetch failed (continuing with the other): %v", proto, err)
+		}
 	}
 
 	shortlist := make([]Pool, 0, maxEnrich)
-	for _, up := range raw {
-		p, ok := toPool(up)
-		if !ok {
-			continue
-		}
-		if !prefilter(p, mp, now) {
-			continue
-		}
-		shortlist = append(shortlist, p)
-		if len(shortlist) >= maxEnrich {
-			// The gateway sorts by TVL descending, so a truncated shortlist
-			// drops the SMALLEST survivors — the ones furthest from the
-			// liquidity we want anyway.
-			break
+	add := func(raw []uniPool, protocol string) {
+		for _, up := range raw {
+			if len(shortlist) >= maxEnrich {
+				// Each universe is TVL-sorted descending, so truncation drops
+				// that protocol's SMALLEST survivors — the ones furthest from
+				// the liquidity we want anyway. v3 fills first by convention.
+				return
+			}
+			p, ok := toPool(up, protocol)
+			if !ok {
+				continue
+			}
+			if !prefilter(p, mp, now) {
+				continue
+			}
+			shortlist = append(shortlist, p)
 		}
 	}
+	add(rawV3, "v3")
+	add(rawV4, "v4")
 	if len(shortlist) == 0 {
 		return nil, nil
 	}
@@ -154,87 +182,83 @@ func FetchMaturePools(mp ModeParams, now time.Time) ([]Pool, error) {
 	return shortlist, nil
 }
 
-// fetchTopV3Pools runs the gateway query and returns the raw pool list.
-func fetchTopV3Pools() ([]uniPool, error) {
-	body, err := json.Marshal(map[string]any{
-		"operationName": "TopV3Pools",
-		"query":         topPoolsQuery,
-		"variables": map[string]any{
-			"chain": strings.ToUpper(Chain),
-			"first": topPoolsFirst,
-		},
-	})
+// fetchTopPools runs one protocol's gateway leaderboard query ("v3" or "v4")
+// and returns the raw pool list.
+func fetchTopPools(protocol string) ([]uniPool, error) {
+	op, query := "TopV3Pools", topPoolsQuery
+	if protocol == "v4" {
+		op, query = "TopV4Pools", topV4PoolsQuery
+	}
+	var data struct {
+		TopV3Pools []uniPool `json:"topV3Pools"`
+		TopV4Pools []uniPool `json:"topV4Pools"`
+	}
+	err := gatewayQuery(op, query, map[string]any{
+		"chain": strings.ToUpper(Chain),
+		"first": topPoolsFirst,
+	}, &data)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, gatewayURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	pools := data.TopV3Pools
+	if protocol == "v4" {
+		pools = data.TopV4Pools
 	}
-	req.Header.Set("Content-Type", "application/json")
-	// The gateway wants a browser-shaped Origin; without it the edge can 403.
-	req.Header.Set("Origin", "https://app.uniswap.org")
-
-	resp, err := gatewayClient.Do(req)
-	if err != nil {
-		return nil, err
+	if len(pools) == 0 {
+		return nil, fmt.Errorf("uniswap gateway returned no %s pools", protocol)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("uniswap gateway status %d", resp.StatusCode)
-	}
-
-	var ur uniResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ur); err != nil {
-		return nil, fmt.Errorf("uniswap gateway decode: %w", err)
-	}
-	if len(ur.Errors) > 0 {
-		// Partial, not fatal — the gateway returns per-pool errors alongside
-		// usable data. Only an empty result is worth failing on.
-		log.Printf("robinhood: uniswap gateway returned %d field error(s), first: %s",
-			len(ur.Errors), ur.Errors[0].Message)
-	}
-	if len(ur.Data.TopV3Pools) == 0 {
-		return nil, fmt.Errorf("uniswap gateway returned no pools")
-	}
-	return ur.Data.TopV3Pools, nil
+	return pools, nil
 }
 
 // toPool maps a gateway pool onto the venue's Pool, orienting it so the base
-// side is the token and the quote side is WETH. The gateway orders token0 /
-// token1 by address, not by role, so WETH lands on either side — Screen's WETH
-// check would reject half the universe if we assumed token1.
+// side is the token and the quote side is a whitelisted quote asset. The
+// gateway orders token0 / token1 by address, not by role, so the quote asset
+// lands on either side — Screen's quote check would reject half the universe
+// if we assumed token1. Native-ETH sides arrive with a null address and are
+// normalized to the NativeETH sentinel so the whitelist can name them.
 //
 // h1 flow, price changes and FDV stay zero here; enrichFromGT fills them.
-func toPool(up uniPool) (Pool, bool) {
-	if up.Address == "" || up.CreatedAtTimestamp == 0 {
+func toPool(up uniPool, protocol string) (Pool, bool) {
+	addr := up.Address
+	if protocol == "v4" {
+		addr = up.PoolID
+	}
+	if addr == "" || up.CreatedAtTimestamp == 0 {
 		return Pool{}, false
 	}
 
-	base, quote := up.Token0, up.Token1
-	if strings.EqualFold(up.Token0.Address, WETH) {
-		base, quote = up.Token1, up.Token0
+	t0, t1 := up.Token0, up.Token1
+	if t0.Address == "" {
+		t0.Address = NativeETH
+	}
+	if t1.Address == "" {
+		t1.Address = NativeETH
 	}
 
 	feePct := up.FeeTier / feeTierDenom
-	return Pool{
-		Address:   up.Address,
-		Name:      fmt.Sprintf("%s / %s %g%%", base.Symbol, quote.Symbol, feePct),
-		Dex:       "uniswap-v3",
-		CreatedAt: time.Unix(up.CreatedAtTimestamp, 0).UTC(),
+	p := Pool{
+		Address:    addr,
+		Dex:        "uniswap-" + protocol,
+		Protocol:   protocol,
+		CreatedAt:  time.Unix(up.CreatedAtTimestamp, 0).UTC(),
+		Hook:       hookAddress(up.Hook),
+		DynamicFee: up.IsDynamicFee,
 
-		BaseAddress:  base.Address,
-		BaseSymbol:   base.Symbol,
-		BaseDecimals: base.Decimals,
-		QuoteAddress: quote.Address,
-		QuoteSymbol:  quote.Symbol,
+		BaseAddress:   t0.Address,
+		BaseSymbol:    t0.Symbol,
+		BaseDecimals:  t0.Decimals,
+		QuoteAddress:  t1.Address,
+		QuoteSymbol:   t1.Symbol,
+		QuoteDecimals: t1.Decimals,
 
 		FeePct:       feePct,
 		ReserveUSD:   up.TotalLiquidity.val(),
 		VolumeH24USD: up.CumulativeVolume.val(),
-	}, true
+	}
+	// Best-effort here — prefilter rejects pools with no quote-asset side.
+	p, _ = orientQuote(p)
+	p.Name = fmt.Sprintf("%s / %s %g%%", p.BaseSymbol, p.QuoteSymbol, feePct)
+	return p, true
 }
 
 // prefilter applies only the gates the gateway alone can answer, to shrink the
@@ -242,7 +266,12 @@ func toPool(up uniPool) (Pool, bool) {
 // anything that survives here still faces the full Screen once enriched, so a
 // prefilter bug can only cost recall, never let a bad pool through.
 func prefilter(p Pool, mp ModeParams, now time.Time) bool {
-	if !strings.EqualFold(p.QuoteAddress, WETH) {
+	if !quoteAssets[strings.ToLower(p.QuoteAddress)] {
+		return false
+	}
+	// v4 hard rejects, duplicated from Screen because they are free here and
+	// every prefilter cut saves enrichment-batch room for a pool that can win.
+	if p.Hook != "" || p.DynamicFee {
 		return false
 	}
 	age := now.Sub(p.CreatedAt)

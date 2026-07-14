@@ -319,6 +319,113 @@ deserve to pass. `ROBINHOOD_SEEN_TTL=6h` means a still-qualifying mature pool
 re-signals every 6h; that is arguably correct for a re-entry candidate, but it is
 untested and interacts with `ROBINHOOD_MAX_OPEN_POSITIONS`.
 
+### Phase 6 — v4 + USDG discovery ✅ (landed 2026-07-14, observe-only)
+
+The 2026-07-14 research run measured why these are ONE feature, not two: of the
+top 80 v4 pools (gateway `topV4Pools`), **47 were USDG-sided, 36 native-ETH,
+only 4 WETH** — while v3 is 67/69 WETH. v4-without-USDG or USDG-on-v3 each buy
+approximately nothing; together they open a fee-printer universe the WETH/v3
+screen was structurally blind to (6 of the day's 9 v4 printers ≥10%/day were
+USDG-quoted).
+
+What landed (discovery/screening only — **no v4 execution**):
+
+- **Quote whitelist** (`types.go`): WETH + USDG
+  (`0x5fc5360d0400a0fd4f2af552add042d716f1d168`, **6 decimals**) + native ETH
+  (zero address — v4 pools ether directly, no wrap). `orientQuote` repairs
+  orientation on BOTH feeds: GT lists USDG base-side in USDG/memecoin pools,
+  and GT spells v4 native ETH as the zero address with symbol "WETH".
+- **rh-fresh** (`discover.go`): the dex filter now branches on
+  `uniswap-v4-robinhood` instead of dropping it (v4's `address` is the bytes32
+  poolId; GT accepts it everywhere, `/pools/multi/` and OHLCV included). One
+  extra aliased gateway call per cycle (`fillV4Meta` → `v4Pool(chain, poolId)`
+  fan-in) resolves what GT does not carry: hook, dynamic-fee flag, true fee
+  tier (v4 names often omit the fee suffix `parseFeePct` reads).
+- **rh-mature** (`mature.go`): fetches both leaderboards — `topV4Pools` beside
+  `topV3Pools`, no unified query exists (`first` max 100). A v4 fetch failure
+  degrades to a v3-only cycle rather than blanking the mode.
+- **v4 hard gates** (`screen.go` + prefilter): reject `hook != null` and
+  `isDynamicFee`. A hook can block or skim withdrawals (behavior is encoded in
+  the 14 low bits of the hook address; the Cork-exploit class) and a dynamic
+  fee invalidates the fee-pace math. Cost today: ~zero — 79/80 top v4 pools
+  are hookless.
+- **Second fail-closed divergence**: a v4 pool whose gateway meta cannot be
+  resolved this cycle is dropped (not marked seen, retries next cycle) — an
+  unverified hook must never pass by looking hookless.
+- **Deploy stays v3-only**: `robinhoodDeploy` filters `protocol == "v4"` out
+  before picking; the v3 executor cannot speak to a poolId (no pool contract
+  exists — state lives in the singleton PoolManager).
+- Payload adds `protocol` ("v3"/"v4") and `hook` (omitted while the hook gate
+  holds) — see docs/SIGNAL_SCHEMA.md.
+
+### Phase 7 — v4 execution ✅ (LIVE 2026-07-15)
+
+Validation round-trip completed on-chain 2026-07-15 (position 96988,
+CASHCAT/WETH 0.2888%: mint 0.002 WETH → state → collect → close, net cost
+~0.000015 WETH + gas), then `ROBINHOOD_V4_EXECUTOR_CMD` enabled in the live
+daemon env and the service restarted. Two chain-specific findings from the
+rollout, both fixed in `uni_v4_executor.js`:
+
+1. **Robinhood's UniversalRouter is an older v4-periphery build** — its
+   `ExactInputSingleParams` still has `sqrtPriceLimitX96`; the modern 5-field
+   struct reverts with empty data. The V4Quoter is a NEWER build (5-field).
+   The executor encodes each contract's own vintage; don't harmonize them.
+2. **Exact-liquidity mints are drift-brittle**: posm has no v3-style partial
+   fill, so any adverse price move between sizing and mint reverts
+   `MaximumAmountExceeded` — on a 100ms-block chain with approval txs in
+   between, that was every attempt on a busy pool. Fixed by approving before
+   the price sample, shaving liquidity 0.3%, and one reprice-retry.
+
+Verified-on-chain addresses (chain 4663):
+PoolManager `0x8366a39cc670b4001a1121b8f6a443a643e40951`, PositionManager
+`0x58daec3116aae6d93017baaea7749052e8a04fa7`, StateView
+`0xf3334192d15450cdd385c8b70e03f9a6bd9e673b`, V4Quoter
+`0x8dc178efb8111bb0973dd9d722ebeff267c98f94`, UniversalRouter
+`0x8876789976decbfcbbbe364623c63652db8c0904`, Permit2 (canonical)
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+
+What landed:
+
+- **`uni_v4_executor.js`** — full sibling of the v3 executor (same command
+  set: address/balance/quote/deploy/positions/state/collect/close/sweep/
+  unwrap, same DRY_RUN + `UNI_CLOSE_AUTH` contracts, same JSON-last-line
+  output). The execution deltas the research called out are all in: state via
+  StateView `getSlot0(poolId)` + fee-growth deltas (the v4 state read DOES
+  price live-accrued fees, unlike v3's); mint/burn via posm
+  `modifyLiquidities` with hand-rolled Actions encoding; fee collect =
+  decrease-0 + TAKE_PAIR; Permit2 approvals for ERC-20 sides; native-ETH
+  quotes settle raw ether (msg.value in, excess rewrapped on close); swaps
+  via UniversalRouter `V4_SWAP` quoted by V4Quoter. Journals are separate
+  files (`uni_v4_positions.jsonl`, `uni_v4_stranded.jsonl`) in the v3 line
+  format — NPM and posm tokenId series both start at 1, so a shared file
+  would collide cost bases. The posm has no `tokenOfOwnerByIndex`, so the
+  mint journal (filtered by live `ownerOf`) IS the position index.
+- **Daemon dispatch** (`scanner.go`, `deploy.go`, `config.go`):
+  `ROBINHOOD_V4_EXECUTOR_CMD` wires a second `robinhood.Runner`; unset keeps
+  v4 observe-only (the pre-Phase-7 behavior, now an eligibility filter
+  instead of a hard drop). The pick chooses the runner by candidate
+  protocol; the position cap counts BOTH executors (one wallet, one brake);
+  USDG-quoted picks size off the USDG balance with dollar-unit params
+  (`ROBINHOOD_DEPLOY_{RESERVE,PCT,FLOOR,CEIL}_USDG`) and forward `--quote`
+  so the executor knows which PoolKey side to settle in.
+  `ROBINHOOD_DEPLOY_MODES` gates direct-deploy per mode — the fresh feed's
+  live close journal (9 of 10 closes were emergency-SL losses, median −49%)
+  argued for mature-only trading with fresh kept as an observe journal.
+- **Monitor** (`uni_monitor.py`): one tick walks both executors (v4 skipped
+  when the script is absent); v4 peak/oor state keys are namespaced
+  `v4:<tokenId>` (v3 keys stay bare for compat with the live state file);
+  the card, close journal, and alerts are quote-aware (`quoteSymbol` —
+  USDG values are already dollars, no ETH/USD conversion); sweep runs per
+  executor against the separate stranded journals. A positions-read failure
+  on one executor no longer blinds — or prunes the state of — the other.
+
+**Open before live v4 money**: no on-chain v4 mint has run yet — first
+rollout step is a tiny manual `deploy --pool <poolId> --amount <floor>` on a
+top hookless pool, then a `state`/`collect`/`close` round-trip, before
+enabling `ROBINHOOD_V4_EXECUTOR_CMD` for the daemon. USDG sizing defaults
+(reserve $5 / floor $8 / ceil $150) are unlived-in; recalibrate from the
+close journal like the WETH set.
+
 ## 4. Risks / open questions
 
 1. **GoPlus coverage of chain 4663** unverified — if unsupported at launch,

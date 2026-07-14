@@ -68,14 +68,18 @@ func (r *Runner) OpenPositions(ctx context.Context) (int, error) {
 	return d.Count, nil
 }
 
-// Balances is the wallet's spendable capital, in ether units. The two are NOT
-// interchangeable here: ETH is native gas, WETH is the LP quote asset. That is
+// Balances is the wallet's spendable capital. ETH and WETH are NOT
+// interchangeable here: ETH is native gas, WETH is an LP quote asset. That is
 // this venue's one structural divergence from Solana, where SOL is both — so
 // dlmm_pipeline.compute_deploy_amount's single `reserve` becomes two guards:
 // a WETH reserve (below) and a native-gas floor (checked by the caller).
+// USDG (dollar units, the token's 6 decimals already applied) is the v4
+// venue's second quote asset; the v3 executor doesn't report it and the
+// field stays 0 there.
 type Balances struct {
 	ETH  float64
 	WETH float64
+	USDG float64
 }
 
 // Balance reads the wallet via `uni_executor.js balance`. Like OpenPositions,
@@ -86,11 +90,14 @@ func (r *Runner) Balance(ctx context.Context) (Balances, error) {
 	if err != nil {
 		return Balances{}, err
 	}
-	// The executor emits balances as decimal STRINGS (viem formatEther output),
-	// not JSON numbers — float64 fields here would fail to unmarshal.
+	// The executor emits balances as decimal STRINGS (viem formatEther /
+	// formatUnits output), not JSON numbers — float64 fields here would fail
+	// to unmarshal. `usdg` only exists in the v4 executor's output; absent
+	// (v3) parses as 0, which is correct — that wallet flow holds no USDG.
 	var d struct {
 		ETH  string `json:"eth"`
 		WETH string `json:"weth"`
+		USDG string `json:"usdg"`
 	}
 	if err := json.Unmarshal([]byte(lastLine(out)), &d); err != nil {
 		return Balances{}, fmt.Errorf("balance: unparseable output: %w", err)
@@ -103,21 +110,29 @@ func (r *Runner) Balance(ctx context.Context) (Balances, error) {
 	if err != nil {
 		return Balances{}, fmt.Errorf("balance: bad weth %q: %w", d.WETH, err)
 	}
-	return Balances{ETH: eth, WETH: weth}, nil
+	var usdg float64
+	if d.USDG != "" {
+		if usdg, err = strconv.ParseFloat(d.USDG, 64); err != nil {
+			return Balances{}, fmt.Errorf("balance: bad usdg %q: %w", d.USDG, err)
+		}
+	}
+	return Balances{ETH: eth, WETH: weth, USDG: usdg}, nil
 }
 
-// SizeParams configures ComputeDeployAmount — the WETH analogues of the Solana
-// pipeline's compute_deploy_amount constants (reserve/pct/floor/ceil).
+// SizeParams configures ComputeDeployAmount — the quote-asset analogues of
+// the Solana pipeline's compute_deploy_amount constants. Field units are the
+// QUOTE ASSET the params are configured for (WETH for the v3/ETH-quoted set,
+// USDG dollars for the USDG set) — one struct, one balance, one unit.
 type SizeParams struct {
-	ReserveWeth float64 // held back, never deployed
-	Pct         float64 // fraction of the deployable balance per position
-	FloorWeth   float64 // smallest position worth its gas + round-trip swap cost
-	CeilWeth    float64 // hard cap per position (0 = uncapped)
+	Reserve float64 // held back, never deployed
+	Pct     float64 // fraction of the deployable balance per position
+	Floor   float64 // smallest position worth its gas + round-trip swap cost
+	Ceil    float64 // hard cap per position (0 = uncapped)
 }
 
-// ComputeDeployAmount sizes one position from the live WETH balance — the port
-// of dlmm_pipeline.py's compute_deploy_amount (reserve 0.2 SOL, pct 0.45,
-// floor 0.3, ceil 5.0).
+// ComputeDeployAmount sizes one position from the live quote-asset balance —
+// the port of dlmm_pipeline.py's compute_deploy_amount (reserve 0.2 SOL,
+// pct 0.45, floor 0.3, ceil 5.0).
 //
 // Taking a PERCENTAGE of the remaining balance rather than a fixed size is the
 // whole point: each open position shrinks the base for the next one, so total
@@ -128,19 +143,19 @@ type SizeParams struct {
 // Returns 0 to mean SKIP THIS DEPLOY — callers must treat it as a skip, never
 // as "deploy nothing". A sub-floor position isn't worth its gas and swap costs,
 // so it is declined outright rather than minted as dust.
-func ComputeDeployAmount(wethBalance float64, p SizeParams) float64 {
-	deployable := wethBalance - p.ReserveWeth
-	if deployable < p.FloorWeth {
+func ComputeDeployAmount(quoteBalance float64, p SizeParams) float64 {
+	deployable := quoteBalance - p.Reserve
+	if deployable < p.Floor {
 		return 0 // can't even fund a floor-sized position — skip
 	}
 	amount := deployable * p.Pct
-	if amount < p.FloorWeth {
+	if amount < p.Floor {
 		// Affordable in total, but below the floor after the percentage haircut:
 		// deploy exactly the floor (the check above proved we can cover it).
-		amount = p.FloorWeth
+		amount = p.Floor
 	}
-	if p.CeilWeth > 0 && amount > p.CeilWeth {
-		amount = p.CeilWeth
+	if p.Ceil > 0 && amount > p.Ceil {
+		amount = p.Ceil
 	}
 	return amount
 }
@@ -155,18 +170,25 @@ func lastLine(out string) string {
 	return t
 }
 
-// Deploy mints one position via `uni_executor.js deploy` and returns its
-// combined stdout+stderr. The error is non-nil only for execution failures
-// (start error, timeout, non-zero exit / on-chain revert) — distinguishable
-// from a clean run via Deployed().
-func (r *Runner) Deploy(ctx context.Context, pool string, amountWeth, rangePct, slippagePct float64, strategy string) (string, error) {
-	return r.run(ctx, "deploy",
+// Deploy mints one position via the executor's `deploy` command and returns
+// its combined stdout+stderr. The error is non-nil only for execution
+// failures (start error, timeout, non-zero exit / on-chain revert) —
+// distinguishable from a clean run via Deployed(). `amount` is in quote
+// units. `quote` is the quote-side asset address for a v4 executor (which
+// side of the PoolKey to size and settle in); empty omits the flag — the v3
+// executor is WETH-only and doesn't know it.
+func (r *Runner) Deploy(ctx context.Context, pool string, amount, rangePct, slippagePct float64, strategy, quote string) (string, error) {
+	args := []string{"deploy",
 		"--pool", pool,
-		"--amount", fmt.Sprintf("%g", amountWeth),
+		"--amount", fmt.Sprintf("%g", amount),
 		"--strategy", strategy,
 		"--range-pct", fmt.Sprintf("%g", rangePct),
 		"--slippage", fmt.Sprintf("%g", slippagePct),
-	)
+	}
+	if quote != "" {
+		args = append(args, "--quote", quote)
+	}
+	return r.run(ctx, args...)
 }
 
 // Deployed reports whether executor output contains a successful (or

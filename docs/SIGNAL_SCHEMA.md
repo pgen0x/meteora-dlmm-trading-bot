@@ -145,9 +145,13 @@ signal weights) before deploying.
 Enabled by `ROBINHOOD_ENABLED` (Phase 1: observe-only — batches journal to the
 daemon log; `ROBINHOOD_WEBHOOK=true` forwards them with `source:
 "robinhood_pool_discovery"` and the same envelope/HMAC transport). Payload is
-an array of screened Uniswap v3 pools on Robinhood Chain (chain ID 4663).
-Never routed to `DEPLOY_CMD` — the deploy pipeline is Solana-only until the
-EVM executor lands (docs/ROBINHOOD_CHAIN_PLAN.md Phase 2).
+an array of screened Uniswap v3 and v4 pools on Robinhood Chain (chain ID
+4663). Never routed to `DEPLOY_CMD` — that pipeline is Solana-only; this venue
+deploys through its own direct path (`robinhoodDeploy` → `uni_executor.js` for
+v3, `uni_v4_executor.js` for v4 — docs/ROBINHOOD_CHAIN_PLAN.md Phases 2 and 7).
+A candidate whose protocol has no executor configured
+(`ROBINHOOD_EXECUTOR_CMD` / `ROBINHOOD_V4_EXECUTOR_CMD`) is excluded from the
+deploy pick and stays observe-only.
 
 ```json
 {
@@ -155,6 +159,7 @@ EVM executor lands (docs/ROBINHOOD_CHAIN_PLAN.md Phase 2).
   "mode": "rh-fresh",
   "pool": "0xc187feb911997c06bc94903def113b677e6577c9",
   "dex": "uniswap-v3",
+  "protocol": "v3",
   "name": "CALLIE / WETH 1%",
   "created_at": "2026-07-13T02:08:17Z",
   "age_minutes": 124.5,
@@ -204,10 +209,20 @@ Field notes:
   v3 fees are deterministic).
 - `holders` + all `gmgn_*` — enrichment, absent on fetch failure (fail-open);
   treat missing as unknown, never zero.
-- Screening already applied: WETH-quoted Uniswap v3 only; age 10m–24h;
+- `protocol` — `"v3"` or `"v4"`. For v4 the `pool` field is the bytes32
+  poolId (pools live inside the singleton PoolManager; there is no per-pool
+  contract) and `dex` is `"uniswap-v4"`.
+- `hook` — v4 hook address, omitted when hookless. Always omitted today:
+  hooked pools and dynamic-fee pools are hard-rejected at screen time (a hook
+  can block or skim withdrawals), so the field only appears if that gate is
+  ever relaxed.
+- Screening already applied: Uniswap v3/v4 quoted in WETH, USDG or (v4)
+  native ETH; v4 hooked/dynamic-fee pools rejected; age 10m–24h;
   reserve $8k–$500k; fee tier ≥ 0.25%; fee pace ≥ 5%/day; ≥30 txns and ≥12
   buyers in h1; a "many buys, zero sells" pool is rejected (honeypot shape);
   FDV $20k–$50M; momentum gates (same thresholds as the Solana venue);
   Blockscout holders ≥ `ROBINHOOD_MIN_HOLDERS`; GMGN rat/bundler caps; GMGN
   contract security **hard-rejects on positive** honeypot/blacklist/sell-tax
-  detection (unknown/null passes — the venue's one fail-closed divergence).
+  detection (unknown/null passes — one of the venue's two fail-closed
+  divergences; the other: a v4 pool whose hook metadata cannot be resolved
+  from the gateway is dropped for the cycle rather than assumed hookless).

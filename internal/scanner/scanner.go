@@ -62,21 +62,23 @@ func rejectSummary(rejects map[string]int) string {
 // Scanner polls the Meteora discovery API for each enabled mode, screens pools,
 // dedups, and forwards newly-qualifying pools to the Hermes webhook.
 type Scanner struct {
-	cfg   config.Config
-	seen  *store.Seen
-	fwd   *webhook.Forwarder
-	dep   *deploy.Runner
-	rhDep *robinhood.Runner
+	cfg     config.Config
+	seen    *store.Seen
+	fwd     *webhook.Forwarder
+	dep     *deploy.Runner
+	rhDep   *robinhood.Runner // uni_executor.js (v3)
+	rhDepV4 *robinhood.Runner // uni_v4_executor.js; disabled when unset
 }
 
 // New wires a Scanner from config.
 func New(cfg config.Config) *Scanner {
 	return &Scanner{
-		cfg:   cfg,
-		seen:  store.New(cfg.RedisAddr, cfg.RedisSeenKey, cfg.SeenTTL),
-		fwd:   webhook.New(cfg.WebhookURL, cfg.WebhookSecret),
-		dep:   deploy.New(cfg.DeployCmd, cfg.ReportCmd, cfg.DeployTimeout),
-		rhDep: robinhood.New(cfg.RobinhoodExecutorCmd, cfg.RobinhoodDeployTimeout),
+		cfg:     cfg,
+		seen:    store.New(cfg.RedisAddr, cfg.RedisSeenKey, cfg.SeenTTL),
+		fwd:     webhook.New(cfg.WebhookURL, cfg.WebhookSecret),
+		dep:     deploy.New(cfg.DeployCmd, cfg.ReportCmd, cfg.DeployTimeout),
+		rhDep:   robinhood.New(cfg.RobinhoodExecutorCmd, cfg.RobinhoodDeployTimeout),
+		rhDepV4: robinhood.New(cfg.RobinhoodV4ExecutorCmd, cfg.RobinhoodDeployTimeout),
 	}
 }
 
@@ -176,20 +178,51 @@ func pickBest(batch []*robinhood.Candidate) *robinhood.Candidate {
 }
 
 func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*robinhood.Candidate) {
+	// Keep only candidates an enabled executor can actually mint: v3 pools
+	// need uni_executor.js, v4 poolIds need uni_v4_executor.js (Phase 7).
+	// With no v4 executor configured, v4 candidates stay observe-only —
+	// exactly the pre-Phase-7 behavior.
+	eligible := batch[:0:0]
+	for _, c := range batch {
+		if c.Protocol == "v4" && s.rhDepV4.Enabled() || c.Protocol != "v4" && s.rhDep.Enabled() {
+			eligible = append(eligible, c)
+		}
+	}
+	if len(eligible) < len(batch) {
+		log.Printf("scanner[%s]: %d candidate(s) excluded from deploy (no executor for their protocol)", mode, len(batch)-len(eligible))
+	}
+	if len(eligible) == 0 {
+		return
+	}
+
 	// Argmax(Score), but demote copycats: a same-symbol collision means we can't
 	// tell the real token from the imposter, so LPing one is a coin flip on
 	// holding the loser. Prefer any clean candidate; only pick a copycat when the
 	// whole batch is contested (then take the strongest, and say so).
-	best := pickBest(batch)
+	best := pickBest(eligible)
 	if best.IsCopycat {
 		log.Printf("scanner[%s]: DEPLOY PICK is a copycat (%s, %d share ticker %q) — no clean candidate this batch",
 			mode, best.Pool[:10], best.CopycatCount, best.BaseSymbol)
 	}
+	runner := s.rhDep
+	if best.Protocol == "v4" {
+		runner = s.rhDepV4
+	}
 
-	open, err := s.rhDep.OpenPositions(ctx)
-	if err != nil {
-		log.Printf("scanner[%s]: DEPLOY SKIPPED (position count unknown, failing closed): %v", mode, err)
-		return
+	// The position cap spans BOTH executors: v3 NPM positions and v4 posm
+	// positions draw on the same wallet, so the brake is per-wallet, not
+	// per-protocol. Fail closed if ANY enabled executor cannot be counted.
+	open := 0
+	for _, r := range []*robinhood.Runner{s.rhDep, s.rhDepV4} {
+		if !r.Enabled() {
+			continue
+		}
+		n, err := r.OpenPositions(ctx)
+		if err != nil {
+			log.Printf("scanner[%s]: DEPLOY SKIPPED (position count unknown, failing closed): %v", mode, err)
+			return
+		}
+		open += n
 	}
 	if open >= s.cfg.RobinhoodMaxOpenPositions {
 		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): at position cap %d/%d",
@@ -200,30 +233,41 @@ func (s *Scanner) robinhoodDeploy(ctx context.Context, mode string, batch []*rob
 	// Size from the LIVE wallet, not a fixed constant — same rationale as the
 	// Solana pipeline's compute_deploy_amount. Fail closed on a balance we
 	// cannot read: guessing a size is how you overspend or mint dust.
-	bal, err := s.rhDep.Balance(ctx)
+	bal, err := runner.Balance(ctx)
 	if err != nil {
 		log.Printf("scanner[%s]: DEPLOY SKIPPED (balance unknown, failing closed): %v", mode, err)
 		return
 	}
-	// Gas is native ETH here, not the WETH we LP with — a WETH-rich wallet can
-	// still be too broke to pay for the mint.
+	// Gas is native ETH here, not the assets we LP with — a WETH/USDG-rich
+	// wallet can still be too broke to pay for the mint.
 	if bal.ETH < s.cfg.RobinhoodMinGasEth {
 		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): gas %.6f ETH < %.6f floor — fund the wallet",
 			mode, best.BaseSymbol, best.Pool[:10], bal.ETH, s.cfg.RobinhoodMinGasEth)
 		return
 	}
-	amount := robinhood.ComputeDeployAmount(bal.WETH, s.cfg.RobinhoodSize)
+	// Size in the candidate's quote asset. USDG pools size off the USDG
+	// balance with the dollar-unit params; WETH and native-ETH pools size off
+	// WETH (the executor unwraps on demand for native settles). The quote
+	// address is only forwarded to the v4 executor — v3 is WETH-only.
+	sizeCfg, sizeBal, unit, quote := s.cfg.RobinhoodSize, bal.WETH, "WETH", ""
+	if best.Protocol == "v4" {
+		quote = best.QuoteAddress
+		if strings.EqualFold(quote, robinhood.USDG) {
+			sizeCfg, sizeBal, unit = s.cfg.RobinhoodSizeUSDG, bal.USDG, "USDG"
+		}
+	}
+	amount := robinhood.ComputeDeployAmount(sizeBal, sizeCfg)
 	if amount <= 0 {
-		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): %.5f WETH balance cannot fund a %.5f floor position (reserve %.5f)",
-			mode, best.BaseSymbol, best.Pool[:10], bal.WETH, s.cfg.RobinhoodSize.FloorWeth, s.cfg.RobinhoodSize.ReserveWeth)
+		log.Printf("scanner[%s]: DEPLOY SKIPPED %s (%s): %.5f %s balance cannot fund a %.5f floor position (reserve %.5f)",
+			mode, best.BaseSymbol, best.Pool[:10], sizeBal, unit, sizeCfg.Floor, sizeCfg.Reserve)
 		return
 	}
 
-	log.Printf("scanner[%s]: DEPLOY PICK %s (%s) score=%.0f amount=%.5f WETH (%.0f%% of %.5f bal, reserve %.5f) strategy=%s",
-		mode, best.BaseSymbol, best.Pool[:10], best.Score, amount,
-		s.cfg.RobinhoodSize.Pct*100, bal.WETH, s.cfg.RobinhoodSize.ReserveWeth, s.cfg.RobinhoodDeployStrategy)
+	log.Printf("scanner[%s]: DEPLOY PICK %s (%s, %s) score=%.0f amount=%.5f %s (%.0f%% of %.5f bal, reserve %.5f) strategy=%s",
+		mode, best.BaseSymbol, best.Pool[:10], best.Protocol, best.Score, amount, unit,
+		sizeCfg.Pct*100, sizeBal, sizeCfg.Reserve, s.cfg.RobinhoodDeployStrategy)
 
-	out, err := s.rhDep.Deploy(ctx, best.Pool, amount, s.cfg.RobinhoodRangePct, s.cfg.RobinhoodSlippagePct, s.cfg.RobinhoodDeployStrategy)
+	out, err := runner.Deploy(ctx, best.Pool, amount, s.cfg.RobinhoodRangePct, s.cfg.RobinhoodSlippagePct, s.cfg.RobinhoodDeployStrategy, quote)
 	if err != nil {
 		log.Printf("scanner[%s]: DEPLOY FAILED %s (%s): %v\n%s", mode, best.BaseSymbol, best.Pool[:10], err, out)
 		return
@@ -328,9 +372,12 @@ func (s *Scanner) pollRobinhood(ctx context.Context, mp robinhood.ModeParams, fe
 
 	sent := 0
 	if len(batch) > 0 {
-		if s.cfg.RobinhoodDeployEnabled && s.rhDep.Enabled() {
+		if s.cfg.RobinhoodDeployEnabled && (s.rhDep.Enabled() || s.rhDepV4.Enabled()) &&
+			s.cfg.RobinhoodDeployModes[strings.TrimPrefix(mp.Mode, "rh-")] {
 			// Direct deploy (Phase 2): bypasses OBSERVE/webhook entirely,
-			// mirroring how Solana's DEPLOY_CMD bypasses its webhook.
+			// mirroring how Solana's DEPLOY_CMD bypasses its webhook. Gated
+			// per-mode by ROBINHOOD_DEPLOY_MODES — a mode outside the set
+			// (e.g. fresh while only mature trades) still journals below.
 			s.robinhoodDeploy(ctx, mp.Mode, batch)
 			sent = len(batch)
 		} else if !s.cfg.RobinhoodWebhook {

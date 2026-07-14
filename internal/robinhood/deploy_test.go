@@ -8,7 +8,7 @@ import (
 
 // defaults mirrors config.go's ROBINHOOD_DEPLOY_* defaults.
 func defaults() SizeParams {
-	return SizeParams{ReserveWeth: 0.002, Pct: 0.45, FloorWeth: 0.003, CeilWeth: 0.05}
+	return SizeParams{Reserve: 0.002, Pct: 0.45, Floor: 0.003, Ceil: 0.05}
 }
 
 func TestComputeDeployAmount(t *testing.T) {
@@ -82,7 +82,7 @@ func TestComputeDeployAmount(t *testing.T) {
 		{
 			name:    "zero ceil means uncapped",
 			balance: 1.0,
-			params:  SizeParams{ReserveWeth: 0.002, Pct: 0.45, FloorWeth: 0.003, CeilWeth: 0},
+			params:  SizeParams{Reserve: 0.002, Pct: 0.45, Floor: 0.003, Ceil: 0},
 			want:    0.4491,
 		},
 	}
@@ -108,8 +108,8 @@ func TestComputeDeployAmountNeverOverspends(t *testing.T) {
 		if got > bal {
 			t.Fatalf("balance %v: size %v exceeds balance", bal, got)
 		}
-		if got > 0 && got > bal-p.ReserveWeth {
-			t.Fatalf("balance %v: size %v eats into the %v reserve", bal, got, p.ReserveWeth)
+		if got > 0 && got > bal-p.Reserve {
+			t.Fatalf("balance %v: size %v eats into the %v reserve", bal, got, p.Reserve)
 		}
 	}
 }

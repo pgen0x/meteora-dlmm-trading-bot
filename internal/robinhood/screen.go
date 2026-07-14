@@ -3,7 +3,6 @@ package robinhood
 import (
 	"fmt"
 	"math"
-	"strings"
 	"time"
 )
 
@@ -116,11 +115,25 @@ const (
 // pool failed; the Candidate is only valid when reason == "". now comes from
 // the caller — clock reads stay at the edges, matching the repo convention.
 func Screen(p Pool, mp ModeParams, now time.Time) (*Candidate, string) {
-	// Quote side must be WETH — the venue analog of the SOL-side requirement.
-	// Comparison is case-insensitive: GeckoTerminal returns lowercase, but
-	// don't depend on it.
-	if !strings.EqualFold(p.QuoteAddress, WETH) {
-		return nil, "non-WETH quote"
+	// Quote side must be a whitelisted quote asset (WETH, USDG, or v4 native
+	// ETH) — the venue analog of the SOL-side requirement. orientQuote also
+	// repairs orientation: sources put the quote asset base-side for USDG
+	// pools, and rejecting on the raw quote field would drop that universe.
+	p, ok := orientQuote(p)
+	if !ok {
+		return nil, fmt.Sprintf("quote not WETH/USDG/ETH (%s/%s)", p.BaseSymbol, p.QuoteSymbol)
+	}
+
+	// v4-only hard gates. A hook can block or skim withdrawals (its behavior
+	// lives in the 14 permission bits of the hook address — the Cork exploit
+	// class), and a dynamic fee invalidates the fee-pace math below — both
+	// reject outright. Costs almost nothing: 79/80 top v4 pools were hookless
+	// on the 2026-07-14 sample.
+	if p.Hook != "" {
+		return nil, fmt.Sprintf("v4 hooked pool (%s)", p.Hook)
+	}
+	if p.DynamicFee {
+		return nil, "v4 dynamic fee"
 	}
 
 	// Distinct reason prefixes on purpose: the cycle tally collapses reasons
@@ -198,11 +211,16 @@ func Screen(p Pool, mp ModeParams, now time.Time) (*Candidate, string) {
 		return nil, fmt.Sprintf("24h %.1f%% <= -25%% (downtrend)", p.ChangeH24Pct)
 	}
 
+	protocol := p.Protocol
+	if protocol == "" {
+		protocol = "v3" // pre-v4 callers (and tests) never set the field
+	}
 	return &Candidate{
 		Chain:        Chain,
 		Mode:         mp.Mode,
 		Pool:         p.Address,
-		Dex:          "uniswap-v3",
+		Dex:          "uniswap-" + protocol,
+		Protocol:     protocol,
 		Name:         p.Name,
 		CreatedAt:    p.CreatedAt.UTC().Format(time.RFC3339),
 		AgeMin:       age.Minutes(),

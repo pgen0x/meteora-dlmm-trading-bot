@@ -1,6 +1,7 @@
-// Package robinhood discovers and screens Uniswap v3 pools on Robinhood Chain
-// (chain ID 4663), mirroring the internal/meteora poll ▸ screen ▸ dedup ▸
-// forward flow for the EVM venue.
+// Package robinhood discovers and screens Uniswap v3 and v4 pools on Robinhood
+// Chain (chain ID 4663), mirroring the internal/meteora poll ▸ screen ▸ dedup ▸
+// forward flow for the EVM venue. v4 pools are discovery/observe-only: the
+// executor speaks v3, and the scanner excludes v4 candidates from deploy.
 //
 // Two modes with two discovery sources, because no single feed spans both
 // theses (see docs/ROBINHOOD_CHAIN_PLAN.md):
@@ -17,6 +18,7 @@ package robinhood
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -29,6 +31,46 @@ const Chain = "robinhood"
 // side we require, playing the role SolMint plays on the Solana venue.
 // Observed as the quote of 16/20 pools on a live new_pools page (2026-07-13).
 const WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+
+// USDG is Paxos' Global Dollar on Robinhood Chain (6 decimals — not 18;
+// anything sizing capital in quote units must care). It is the venue's second
+// quote asset and the dominant one on Uniswap v4: 47 of the top 80 v4 pools
+// were USDG-sided on the 2026-07-14 gateway sample, versus 5 of 69 on v3.
+// Address confirmed against Paxos' mainnet address table.
+const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+
+// NativeETH is the zero address, which is how both data sources spell a v4
+// native-ETH pool side (v4 pools ether directly, no WETH wrap). GeckoTerminal
+// reports the zero address with symbol "WETH"; the Uniswap gateway reports a
+// null address with symbol "ETH" (normalized to this constant in toPool).
+const NativeETH = "0x0000000000000000000000000000000000000000"
+
+// quoteAssets is the whitelist of accepted quote-side assets — the venue
+// analog of the Solana SOL-side requirement, widened from WETH-only when v4
+// discovery landed. Keys are lowercase addresses.
+var quoteAssets = map[string]bool{
+	WETH:      true,
+	USDG:      true,
+	NativeETH: true,
+}
+
+// orientQuote returns p with its quote side guaranteed to be a whitelisted
+// quote asset, swapping base/quote when a source put the quote asset on the
+// base side (GeckoTerminal lists USDG base-side in USDG/memecoin pools; the
+// gateway orders token0/token1 by address). ok is false when neither side is
+// a quote asset — such pools are out of thesis entirely.
+func orientQuote(p Pool) (Pool, bool) {
+	if quoteAssets[strings.ToLower(p.QuoteAddress)] {
+		return p, true
+	}
+	if quoteAssets[strings.ToLower(p.BaseAddress)] {
+		p.BaseAddress, p.QuoteAddress = p.QuoteAddress, p.BaseAddress
+		p.BaseSymbol, p.QuoteSymbol = p.QuoteSymbol, p.BaseSymbol
+		p.BaseDecimals, p.QuoteDecimals = p.QuoteDecimals, p.BaseDecimals
+		return p, true
+	}
+	return p, false
+}
 
 // gtTxWindow is the buys/sells breakdown for one time window.
 type gtTxWindow struct {
@@ -108,16 +150,23 @@ type gtResponse struct {
 
 // Pool is a decoded, unit-normalized GeckoTerminal pool ready for screening.
 type Pool struct {
-	Address   string // v3 pool contract address (v4 pools carry a bytes32 id and are filtered out)
+	Address   string // v3 pool contract address, or the bytes32 poolId for v4
 	Name      string // "CALLIE / WETH 0.3%"
 	Dex       string // "uniswap-v3-robinhood"
+	Protocol  string // "v3" or "v4", derived from the dex id
 	CreatedAt time.Time
 
-	BaseAddress  string
-	BaseSymbol   string
-	BaseDecimals int
-	QuoteAddress string
-	QuoteSymbol  string
+	// v4-only, from the Uniswap gateway (GeckoTerminal exposes neither).
+	// Zero values on v3 pools, where no hook or dynamic fee can exist.
+	Hook       string // hook contract address; "" = hookless
+	DynamicFee bool
+
+	BaseAddress   string
+	BaseSymbol    string
+	BaseDecimals  int
+	QuoteAddress  string
+	QuoteSymbol   string
+	QuoteDecimals int
 
 	FeePct     float64 // parsed from the trailing "0.3%" in Name; 0 = unknown
 	ReserveUSD float64
@@ -141,11 +190,17 @@ type Pool struct {
 type Candidate struct {
 	Chain     string  `json:"chain"` // always "robinhood"
 	Mode      string  `json:"mode"`
-	Pool      string  `json:"pool"`
-	Dex       string  `json:"dex"` // "uniswap-v3"
+	Pool      string  `json:"pool"`     // v3 pool contract address, or bytes32 poolId for v4
+	Dex       string  `json:"dex"`      // "uniswap-v3" or "uniswap-v4"
+	Protocol  string  `json:"protocol"` // "v3" or "v4"
 	Name      string  `json:"name"`
 	CreatedAt string  `json:"created_at"` // RFC3339
 	AgeMin    float64 `json:"age_minutes"`
+
+	// Hook is the v4 hook address. Always empty today: hooked pools are
+	// hard-rejected at screen time (a hook can block or skim withdrawals),
+	// so the field only becomes non-empty if that gate is ever relaxed.
+	Hook string `json:"hook,omitempty"`
 
 	BaseAddress  string `json:"base_address"`
 	BaseSymbol   string `json:"base_symbol"`

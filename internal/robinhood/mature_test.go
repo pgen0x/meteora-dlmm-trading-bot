@@ -137,7 +137,7 @@ func TestToPoolOrientsWETHAsQuote(t *testing.T) {
 			CumulativeVolume:   &uniAmount{Value: 740000},
 			Token0:             c.token0,
 			Token1:             c.token1,
-		})
+		}, "v3")
 		if !ok {
 			t.Fatalf("%s: toPool rejected a valid pool", c.name)
 		}
@@ -147,6 +147,80 @@ func TestToPoolOrientsWETHAsQuote(t *testing.T) {
 		if p.BaseSymbol != "MEOW" {
 			t.Errorf("%s: base symbol = %q, want MEOW", c.name, p.BaseSymbol)
 		}
+	}
+}
+
+// v4 gateway entries: the id lives in poolId (bytes32), native-ETH sides come
+// back with an EMPTY address and must normalize to the NativeETH sentinel, and
+// USDG must be recognized as the quote even when address-ordering puts it on
+// token1 with a memecoin on token0.
+func TestToPoolV4(t *testing.T) {
+	usdg := uniToken{Address: USDG, Symbol: "USDG", Decimals: 6}
+	cash := uniToken{Address: "0x020bfC650A365f8BB26819deAAbF3E21291018b4", Symbol: "CASHCAT", Decimals: 18}
+	eth := uniToken{Symbol: "ETH", Decimals: 18} // gateway sends null address for native ETH
+
+	p, ok := toPool(uniPool{
+		PoolID:             "0xee0d95c4644e0847eca78d5f5333abe1ab798b159fdd01712327258a755d4423",
+		CreatedAtTimestamp: 1783526658,
+		FeeTier:            5000,
+		Token0:             cash,
+		Token1:             usdg,
+	}, "v4")
+	if !ok {
+		t.Fatal("toPool rejected a valid v4 pool")
+	}
+	if p.Protocol != "v4" || p.Dex != "uniswap-v4" {
+		t.Errorf("protocol fields wrong: protocol=%q dex=%q", p.Protocol, p.Dex)
+	}
+	if !strings.HasPrefix(p.Address, "0xee0d95c4") {
+		t.Errorf("v4 address should be the poolId, got %q", p.Address)
+	}
+	if p.QuoteSymbol != "USDG" || p.BaseSymbol != "CASHCAT" {
+		t.Errorf("USDG should orient to the quote side: base=%q quote=%q", p.BaseSymbol, p.QuoteSymbol)
+	}
+	if p.QuoteDecimals != 6 {
+		t.Errorf("USDG quote decimals = %d, want 6", p.QuoteDecimals)
+	}
+
+	p, ok = toPool(uniPool{
+		PoolID:             "0x54f7883914619af9105355bf83ed678bcf9f63560218ac61c9963b9503d0ba32",
+		CreatedAtTimestamp: 1783521035,
+		FeeTier:            460,
+		Token0:             eth,
+		Token1:             usdg,
+	}, "v4")
+	if !ok {
+		t.Fatal("toPool rejected a valid native-ETH v4 pool")
+	}
+	// Both sides are quote assets here (ETH/USDG); whichever wins, the empty
+	// native address must have been normalized to the sentinel, never "".
+	if p.BaseAddress == "" || p.QuoteAddress == "" {
+		t.Errorf("native ETH side not normalized: base=%q quote=%q", p.BaseAddress, p.QuoteAddress)
+	}
+	if p.FeePct != 0.046 {
+		t.Errorf("v4 feeTier 460 => %v%%, want 0.046%%", p.FeePct)
+	}
+}
+
+// A hooked v4 pool must carry its hook through toPool so prefilter/Screen can
+// reject it — a dropped hook field would read as hookless and pass.
+func TestToPoolCarriesHook(t *testing.T) {
+	hooked := uniPool{
+		PoolID:             "0xabc0000000000000000000000000000000000000000000000000000000000001",
+		CreatedAtTimestamp: 1781812885,
+		FeeTier:            3000,
+		IsDynamicFee:       true,
+	}
+	hooked.Hook = &struct {
+		Address string `json:"address"`
+	}{Address: "0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544"}
+
+	p, ok := toPool(hooked, "v4")
+	if !ok {
+		t.Fatal("toPool rejected the pool")
+	}
+	if p.Hook == "" || !p.DynamicFee {
+		t.Errorf("hook/dynamic-fee lost in mapping: hook=%q dynamic=%v", p.Hook, p.DynamicFee)
 	}
 }
 
@@ -163,7 +237,7 @@ func TestToPoolFeeTierToPercent(t *testing.T) {
 		{100, 0.01},
 	}
 	for _, c := range cases {
-		p, ok := toPool(uniPool{Address: "0xabc", CreatedAtTimestamp: 1781812885, FeeTier: c.tier})
+		p, ok := toPool(uniPool{Address: "0xabc", CreatedAtTimestamp: 1781812885, FeeTier: c.tier}, "v3")
 		if !ok {
 			t.Fatalf("tier %v: toPool rejected a valid pool", c.tier)
 		}
@@ -176,7 +250,7 @@ func TestToPoolFeeTierToPercent(t *testing.T) {
 // A nil money wrapper (a pool the gateway has not finished indexing) must read
 // as zero, not panic.
 func TestToPoolNilAmounts(t *testing.T) {
-	p, ok := toPool(uniPool{Address: "0xabc", CreatedAtTimestamp: 1781812885, FeeTier: 10000})
+	p, ok := toPool(uniPool{Address: "0xabc", CreatedAtTimestamp: 1781812885, FeeTier: 10000}, "v3")
 	if !ok {
 		t.Fatal("toPool rejected a pool with nil amounts")
 	}
@@ -186,12 +260,16 @@ func TestToPoolNilAmounts(t *testing.T) {
 }
 
 func TestToPoolRejectsUnusable(t *testing.T) {
-	if _, ok := toPool(uniPool{CreatedAtTimestamp: 1781812885}); ok {
+	if _, ok := toPool(uniPool{CreatedAtTimestamp: 1781812885}, "v3"); ok {
 		t.Error("pool with no address should be rejected")
 	}
 	// No creation timestamp means no age, and every mature gate is age-relative.
-	if _, ok := toPool(uniPool{Address: "0xabc"}); ok {
+	if _, ok := toPool(uniPool{Address: "0xabc"}, "v3"); ok {
 		t.Error("pool with no createdAtTimestamp should be rejected")
+	}
+	// A v4 entry carries its id in poolId, not address.
+	if _, ok := toPool(uniPool{Address: "0xabc", CreatedAtTimestamp: 1781812885}, "v4"); ok {
+		t.Error("v4 pool with no poolId should be rejected")
 	}
 }
 
@@ -218,7 +296,9 @@ func TestPrefilterRejects(t *testing.T) {
 		name   string
 		mutate func(*Pool)
 	}{
-		{"non-weth quote", func(p *Pool) { p.QuoteAddress = "0x1111111111111111111111111111111111111111" }},
+		{"non-quote-asset quote", func(p *Pool) { p.QuoteAddress = "0x1111111111111111111111111111111111111111" }},
+		{"v4 hooked pool", func(p *Pool) { p.Hook = "0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544" }},
+		{"v4 dynamic fee", func(p *Pool) { p.DynamicFee = true }},
 		{"younger than min age", func(p *Pool) { p.CreatedAt = now.Add(-2 * time.Hour) }},
 		{"reserve floor", func(p *Pool) { p.ReserveUSD = 9000 }},
 		{"reserve cap", func(p *Pool) { p.ReserveUSD = 900000 }},

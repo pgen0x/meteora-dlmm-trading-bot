@@ -69,7 +69,9 @@ func TestScreenRejects(t *testing.T) {
 		mutate func(*Pool)
 		want   string // reason prefix
 	}{
-		{"non-weth quote", func(p *Pool) { p.QuoteAddress = "0x1111111111111111111111111111111111111111" }, "non-WETH"},
+		{"non-quote-asset quote", func(p *Pool) { p.QuoteAddress = "0x1111111111111111111111111111111111111111" }, "quote not"},
+		{"v4 hooked pool", func(p *Pool) { p.Hook = "0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544" }, "v4 hooked"},
+		{"v4 dynamic fee", func(p *Pool) { p.DynamicFee = true }, "v4 dynamic"},
 		{"too young", func(p *Pool) { p.CreatedAt = now.Add(-1 * time.Minute) }, "too-young"},
 		{"too old", func(p *Pool) { p.CreatedAt = now.Add(-30 * time.Hour) }, "too-old"},
 		{"reserve floor", func(p *Pool) { p.ReserveUSD = 500 }, "reserve"},
@@ -97,6 +99,59 @@ func TestScreenRejects(t *testing.T) {
 		if !strings.HasPrefix(reason, c.want) {
 			t.Errorf("%s: reason = %q, want prefix %q", c.name, reason, c.want)
 		}
+	}
+}
+
+// The venue's second and third quote assets: USDG pools and v4 native-ETH
+// pools must pass the quote gate, and a quote asset arriving on the BASE side
+// (GeckoTerminal lists USDG base-side in USDG/memecoin pools) must be
+// re-oriented, not rejected.
+func TestScreenQuoteAssets(t *testing.T) {
+	now := time.Now()
+
+	usdg := passingPool(now)
+	usdg.Protocol = "v4"
+	usdg.QuoteAddress, usdg.QuoteSymbol, usdg.QuoteDecimals = USDG, "USDG", 6
+	cand, reason := Screen(usdg, Fresh, now)
+	if reason != "" {
+		t.Fatalf("USDG-quoted pool: expected pass, got reject: %s", reason)
+	}
+	if cand.Dex != "uniswap-v4" || cand.Protocol != "v4" {
+		t.Errorf("v4 candidate fields wrong: dex=%q protocol=%q", cand.Dex, cand.Protocol)
+	}
+
+	native := passingPool(now)
+	native.Protocol = "v4"
+	native.QuoteAddress, native.QuoteSymbol = NativeETH, "ETH"
+	if _, reason := Screen(native, Fresh, now); reason != "" {
+		t.Errorf("native-ETH-quoted v4 pool: expected pass, got reject: %s", reason)
+	}
+
+	flipped := passingPool(now)
+	flipped.Protocol = "v4"
+	// USDG on the base side, memecoin on the quote side — the GT orientation
+	// for USDG/memecoin pairs.
+	flipped.BaseAddress, flipped.BaseSymbol, flipped.BaseDecimals = USDG, "USDG", 6
+	flipped.QuoteAddress, flipped.QuoteSymbol, flipped.QuoteDecimals = "0x21028be78e8f521214d24328715c1a8aadbac5a8", "CALLIE", 18
+	cand, reason = Screen(flipped, Fresh, now)
+	if reason != "" {
+		t.Fatalf("base-side USDG pool: expected pass, got reject: %s", reason)
+	}
+	if cand.QuoteSymbol != "USDG" || cand.BaseSymbol != "CALLIE" {
+		t.Errorf("orientation not repaired: base=%q quote=%q", cand.BaseSymbol, cand.QuoteSymbol)
+	}
+}
+
+// A v3 pool never sets Protocol today (only discover/mature constructors do);
+// Screen must default it rather than emit an empty dex.
+func TestScreenProtocolDefault(t *testing.T) {
+	now := time.Now()
+	cand, reason := Screen(passingPool(now), Fresh, now)
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	if cand.Protocol != "v3" || cand.Dex != "uniswap-v3" {
+		t.Errorf("protocol default wrong: dex=%q protocol=%q", cand.Dex, cand.Protocol)
 	}
 }
 

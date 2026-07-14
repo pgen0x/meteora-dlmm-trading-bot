@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/meteora-dlmm-trading-bot/internal/robinhood"
@@ -113,11 +114,24 @@ type Config struct {
 	// closed by hand, so RobinhoodMaxOpenPositions is the only safety brake.
 	// Off by default; requires RobinhoodExecutorCmd.
 	RobinhoodDeployEnabled bool
+	// RobinhoodDeployModes limits direct-deploy to the listed modes; batches
+	// from other modes fall back to the observe/webhook sink instead. The
+	// deploy toggle alone is all-or-nothing, and the fresh feed's live record
+	// (uni_closes.jsonl 2026-07-13/14: 9 of 10 closes were emergency stop
+	// losses at a median −49% within ~1 minute) showed why mature-only deploy
+	// with fresh kept as an observe journal must be expressible. Keys are the
+	// mode names with the "rh-" prefix stripped ("fresh", "mature").
+	RobinhoodDeployModes map[string]bool
 	// RobinhoodExecutorCmd is the whitespace-split command line for
 	// uni_executor.js, e.g.
 	// "node /home/ubuntu/.hermes/profiles/<profile>/skills/solana-dlmm/scripts/uni_executor.js".
 	// Wallet keys stay in the profile .env — the executor loads them itself.
 	RobinhoodExecutorCmd string
+	// RobinhoodV4ExecutorCmd is the same for uni_v4_executor.js, the v4
+	// sibling (docs/ROBINHOOD_CHAIN_PLAN.md Phase 7). Empty (default) keeps
+	// v4 candidates observe-only: they are journaled/forwarded upstream but
+	// excluded from deploy, exactly the pre-Phase-7 behavior.
+	RobinhoodV4ExecutorCmd string
 	// RobinhoodDeployTimeout bounds one uni_executor.js invocation
 	// (swap + mint can take a few blocks even at Robinhood Chain's ~100ms pace).
 	RobinhoodDeployTimeout time.Duration
@@ -127,6 +141,13 @@ type Config struct {
 	// ROBINHOOD_DEPLOY_AMOUNT_WETH, which minted a flat 0.003 WETH regardless of
 	// wallet size (~17% of a 0.0174 WETH stack) and never grew with the balance.
 	RobinhoodSize robinhood.SizeParams
+	// RobinhoodSizeUSDG sizes USDG-quoted v4 deploys from the live USDG
+	// balance — same shape, dollar units (USDG's 6 decimals are already
+	// applied by the executor's balance output). Separate params because a
+	// sensible WETH floor (~0.003 ≈ $8) and a sensible dollar floor are
+	// different numbers, and sharing one config would silently misprice
+	// whichever asset the operator wasn't thinking about.
+	RobinhoodSizeUSDG robinhood.SizeParams
 	// RobinhoodMinGasEth is the native-ETH floor required to deploy. Unlike
 	// Solana — where SOL is gas AND quote, so one reserve covers both — this
 	// venue pays gas in ETH but LPs in WETH, so a wallet flush with WETH can
@@ -219,6 +240,24 @@ func getdur(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// getmodes parses a comma-separated mode list into a set. Entries are
+// lowercased and the "rh-" prefix is stripped, so "mature", "rh-mature" and
+// "RH-Mature" all name the same mode.
+func getmodes(key, def string) map[string]bool {
+	v := os.Getenv(key)
+	if v == "" {
+		v = def
+	}
+	set := make(map[string]bool)
+	for _, m := range strings.Split(v, ",") {
+		m = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(m)), "rh-")
+		if m != "" {
+			set[m] = true
+		}
+	}
+	return set
+}
+
 // Load builds a Config from the environment with sane public defaults.
 func Load() Config {
 	return Config{
@@ -247,17 +286,27 @@ func Load() Config {
 		RobinhoodDiscoverURL:      getenv("ROBINHOOD_DISCOVER_URL", ""),
 		RobinhoodWebhook:          getbool("ROBINHOOD_WEBHOOK", false),
 		RobinhoodDeployEnabled:    getbool("ROBINHOOD_DEPLOY_ENABLED", false),
+		RobinhoodDeployModes:      getmodes("ROBINHOOD_DEPLOY_MODES", "fresh,mature"),
 		RobinhoodExecutorCmd:      getenv("ROBINHOOD_EXECUTOR_CMD", ""),
+		RobinhoodV4ExecutorCmd:    getenv("ROBINHOOD_V4_EXECUTOR_CMD", ""),
 		RobinhoodDeployTimeout:    getdur("ROBINHOOD_DEPLOY_TIMEOUT", 2*time.Minute),
 		RobinhoodSize: robinhood.SizeParams{
 			// Same 45% pct as the Solana pipeline. Floor is the old fixed size —
 			// a position smaller than that isn't worth its gas + round-trip swap.
 			// Ceil bounds a single position while the venue is still young; raise
 			// it as the wallet and the venue's close journal grow.
-			ReserveWeth: getfloat("ROBINHOOD_DEPLOY_RESERVE_WETH", 0.002),
-			Pct:         getfloat("ROBINHOOD_DEPLOY_PCT", 0.45),
-			FloorWeth:   getfloat("ROBINHOOD_DEPLOY_FLOOR_WETH", 0.003),
-			CeilWeth:    getfloat("ROBINHOOD_DEPLOY_CEIL_WETH", 0.05),
+			Reserve: getfloat("ROBINHOOD_DEPLOY_RESERVE_WETH", 0.002),
+			Pct:     getfloat("ROBINHOOD_DEPLOY_PCT", 0.45),
+			Floor:   getfloat("ROBINHOOD_DEPLOY_FLOOR_WETH", 0.003),
+			Ceil:    getfloat("ROBINHOOD_DEPLOY_CEIL_WETH", 0.05),
+		},
+		RobinhoodSizeUSDG: robinhood.SizeParams{
+			// Dollar units. Floor ≈ the WETH floor's dollar value; ceil bounds a
+			// single USDG position at roughly the WETH ceil's dollar value.
+			Reserve: getfloat("ROBINHOOD_DEPLOY_RESERVE_USDG", 5),
+			Pct:     getfloat("ROBINHOOD_DEPLOY_PCT_USDG", 0.45),
+			Floor:   getfloat("ROBINHOOD_DEPLOY_FLOOR_USDG", 8),
+			Ceil:    getfloat("ROBINHOOD_DEPLOY_CEIL_USDG", 150),
 		},
 		RobinhoodMinGasEth:      getfloat("ROBINHOOD_MIN_GAS_ETH", 0.0002),
 		RobinhoodDeployStrategy: getenv("ROBINHOOD_DEPLOY_STRATEGY", "balanced_tight"),
