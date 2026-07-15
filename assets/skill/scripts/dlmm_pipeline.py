@@ -19,12 +19,16 @@ MIN_HOLDERS = 100
 DEFAULT_DEPLOY_SOL = 0.5
 
 # Mode defaults (overridden by SOUL.md per-mode blocks)
+# MIN_HOLDERS recalibrated 2026-07-15 from the 14d close journal: big losers
+# entered at median ~7.8k holders vs winners ~13.6k; casual >=10k and multiday
+# >=5k each flipped their mode's journal PnL positive. Keep in sync with
+# internal/meteora/screen.go (daemon-side prefilter) and SOUL.md section 9.
 MODE_DEFAULTS = {
     "casual": {
         "MIN_TVL_USD": 5000.0,
         "MIN_FEE_TVL_24H": 0.3,
         "MIN_MCAP_USD": 250000.0,
-        "MIN_HOLDERS": 500,
+        "MIN_HOLDERS": 10000,
         "TIMEFRAME": "30m",
         "MAX_POSITIONS": 2,
     },
@@ -32,7 +36,7 @@ MODE_DEFAULTS = {
         "MIN_TVL_USD": 50000.0,
         "MIN_FEE_TVL_24H": 1.0,
         "MIN_MCAP_USD": 1000000.0,
-        "MIN_HOLDERS": 1000,
+        "MIN_HOLDERS": 5000,
         "TIMEFRAME": "24h",
         "MAX_POSITIONS": 2,
     },
@@ -851,6 +855,13 @@ def main():
         print(f"[SKIP] Wallet {sol_balance:.3f} SOL < 0.25 SOL minimum — aborting pipeline (no SOL to deploy)")
         sys.exit(0)
     deploy_sol = compute_deploy_amount(sol_balance)
+    # Turnover runs at half size (2026-07-15): the mode booked -0.10 SOL over
+    # 14d and its big losers (WORLDCUP hard SL, febu OOR dump) passed every
+    # entry signal we screen on — the tail risk is structural to the thesis
+    # (tight ranges on fresh degen pools), so cap exposure instead of tuning
+    # gates that don't discriminate.
+    if mode == "turnover":
+        deploy_sol = round(deploy_sol * 0.5, 2)
     if (deploy_sol <= 0 or deploy_sol < 0.10) and not cli.analyze_only:
         print(f"Aborting: deploy amount {deploy_sol:.3f} SOL below 0.10 SOL minimum (wallet {sol_balance:.3f} SOL)")
         sys.exit(0)

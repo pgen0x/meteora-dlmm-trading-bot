@@ -58,7 +58,11 @@ def get_meteora_portfolio_positions(wallet_address):
     except Exception as e:
         return None, str(e)
 
-STOP_LOSS_PCT = -25.0
+# Fallback only — SOUL.md section 9 "Hard Stop-Loss" overrides at runtime.
+# -12.0 since 2026-07-15: the 14d journal's four SL closes booked -0.24 SOL
+# (-15.1% to -19.4% after slippage) while trailing TP caps wins at ~+1-2%; a
+# tighter floor trades more small losses for a thinner tail.
+STOP_LOSS_PCT = -12.0
 TAKE_PROFIT_PCT = 50.0
 MAX_OOR_MINUTES = 30
 # Turnover fast-cycle: an OOR turnover position is idle
@@ -706,6 +710,10 @@ def main():
                         print(f"🔴 REPEAT LOSS #{loss_streak} in 7d — escalated {base_symbol_cd} cooldown to {escalated_secs // 3600}h")
                 else:
                     run_command(f"redis-cli del \"sol:dlmm:loss_streak:{base_symbol_cd}\"")  # reset streak on profit
+                    # Match the auto-close path: profitable exit shortens to 15m.
+                    if realized_sol > 0 and not any(kw in reason_lower for kw in ("stop-loss", "stop_loss", "downtrend")):
+                        run_command(f"redis-cli expire \"{cooldown_key}\" 900")
+                        print(f"🚫 Cooldown shortened to 15m for {base_symbol_cd} (profitable force-close)")
                 print(f"📊 Daily PnL booked: {realized_sol:+.4f} SOL ({guard_pnl_pct:+.2f}%)")
             # Auto-swap base token back to SOL
             base_mint = meta.get("base_mint")
@@ -1378,12 +1386,17 @@ def main():
                     print(f"⛔ Turnover rebalance circuit breaker tripped: pool 24h rebalance PnL {rebalance_pnl_24h:+.4f} SOL <= {cb_floor_sol} SOL floor — normal exit + cooldown")
                 else:
                     cooldown_secs = 7200 if is_dump_close else 3600  # 2h dump, 1h other
-                    # Clean profitable casual exit: the pool is often still hot after a
-                    # 30m-window harvest — a full 1h block just forfeits re-entry. Dump
-                    # closes and losses keep the longer cooldowns (and the loss-streak
-                    # escalation below only fires on realized_sol < 0 anyway).
-                    if not is_dump_close and realized_sol > 0 and meta.get("mode", "multiday") == "casual":
-                        cooldown_secs = 1800
+                    # Profitable exit: 15m across all modes (2026-07-15, was 30m
+                    # casual-only). A pool that just paid is proven; a long block only
+                    # forfeits re-entry while it's still hot — journal shows after-WIN
+                    # same-day re-entries net positive. Deliberately overrides the
+                    # dump-class 2h too: trailing-TP and fast-out reasons contain
+                    # "trailing"/"dump" so winners were getting the LONGEST cooldown.
+                    # Real loss events (stop-loss / downtrend) stay excluded, and the
+                    # pipeline's entry momentum gates still reject a re-signal if the
+                    # token is dumping when the cooldown clears.
+                    if realized_sol > 0 and not any(kw in reason_lower for kw in ("stop-loss", "stop_loss", "downtrend")):
+                        cooldown_secs = 900
                     if realized_sol < 0:
                         # Track repeat losses within a 7-day window and escalate cooldown duration
                         run_command(f"redis-cli incr \"{loss_streak_key}\"")
@@ -1396,7 +1409,8 @@ def main():
                     else:
                         run_command(f"redis-cli del \"{loss_streak_key}\"")  # reset streak on profit
                     run_command(f"redis-cli set \"{cooldown_key}\" \"{close_reason[:120]}\" ex {cooldown_secs}")
-                    print(f"🚫 Re-entry cooldown set for {base_symbol_cd}: {cooldown_secs // 3600}h (reason: {'dump/momentum' if is_dump_close else 'normal exit'})")
+                    cd_label = f"{cooldown_secs // 60}m" if cooldown_secs < 3600 else f"{cooldown_secs // 3600}h"
+                    print(f"🚫 Re-entry cooldown set for {base_symbol_cd}: {cd_label} (reason: {'profitable exit' if cooldown_secs == 900 else ('dump/momentum' if is_dump_close else 'normal exit')})")
 
                 # Low-yield exits also cool the POOL itself for 4h (ported from
                 # the reference bot's low-yield pool cooldown): the symbol cooldown above
