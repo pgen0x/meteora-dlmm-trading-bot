@@ -1096,6 +1096,30 @@ def main():
             ttl_mins = int(ttl_out) // 60 if ttl_out and ttl_out.lstrip("-").isdigit() else "?"
             print(f"Skipping {c['name']} - re-entry cooldown active ({ttl_mins}m remaining, reason: {cooldown_val[:60]})")
             continue
+        # Mint-keyed cooldown: the symbol key above is evadable (a rug that
+        # relaunches under a new ticker keeps its mint history; an unrelated
+        # token sharing the ticker inherits a cooldown it never earned). The
+        # monitor sets both keys on close; check both here.
+        if c.get("base_mint"):
+            mint_cd, _, _ = run_command(f"redis-cli get \"sol:dlmm:cooldown:mint:{c['base_mint']}\"")
+            if mint_cd and mint_cd != "(nil)":
+                print(f"Skipping {c['name']} - mint cooldown active (reason: {mint_cd[:60]})")
+                continue
+            # Permanent rug blacklist (mint) — set by the monitor on
+            # catastrophic closes. SISMEMBER returns "1"/"0".
+            bl_mint, _, _ = run_command(f"redis-cli sismember sol:dlmm:blocklist:mint \"{c['base_mint']}\"")
+            if bl_mint and bl_mint.strip() == "1":
+                print(f"Skipping {c['name']} - mint is on the permanent rug blacklist")
+                continue
+        # Dev blocklist (ported from the reference bot's dev-blocklist): the
+        # daemon ships the Jupiter deployer wallet as `dev`; a deployer that
+        # already rugged us never gets a second deploy. Missing dev = unknown,
+        # passes (fail-open).
+        if c.get("dev"):
+            bl_dev, _, _ = run_command(f"redis-cli sismember sol:dlmm:blocklist:dev \"{c['dev']}\"")
+            if bl_dev and bl_dev.strip() == "1":
+                print(f"Skipping {c['name']} - deployer {c['dev'][:8]}… is on the dev blocklist")
+                continue
         # Pool-level cooldown (repeat-deploy churn guard, set post-deploy below).
         pool_cd, _, _ = run_command(f"redis-cli get \"sol:dlmm:cooldown:pool:{c['pool']}\"")
         if pool_cd and pool_cd != "(nil)":
@@ -1508,6 +1532,9 @@ def main():
         "amount_x": amount_x,
         "amount_y": amount_y,
         "mode": mode,
+        # Deployer wallet (daemon-enriched, may be absent) — a rug close adds
+        # it to sol:dlmm:blocklist:dev so this deployer never deploys us again.
+        "dev": winner.get("dev", ""),
         # Entry-time signal snapshot — the monitor copies this into the close
         # journal so dlmm_weights.py can learn which signals predict winners.
         "signal": {k: winner.get(k) for k in (
