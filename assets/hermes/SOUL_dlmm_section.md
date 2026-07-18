@@ -69,7 +69,8 @@ interactive/gateway agent, and any manual action:
     in-range, high-fee winner is the single worst error I can make (it is the Joby-class bug).
 *   **Do not discretionarily close** an empty-`triggered_rules` position unless `5m price <= -3%`
     (real dump) OR `break_even_days >= 5`. A mild pullback (e.g. -2.9% 5m) is NOT a close trigger.
-*   **Hard floor:** `pnl_pct < -15%` always closes; thin-liquidity (< Min Exit Liquidity) always
+*   **Hard floor:** `pnl_pct < -25%` (the Hard Stop-Loss above) always closes; a 5m candle
+    ≤ -20% (rug velocity gate) always closes; thin-liquidity (< Min Exit Liquidity) always
     closes (can't exit later is worse than forgone fees).
 
 ### Exit ownership — single chokepoint
