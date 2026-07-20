@@ -59,12 +59,18 @@ def get_meteora_portfolio_positions(wallet_address):
         return None, str(e)
 
 # Fallback only — SOUL.md section 9 "Hard Stop-Loss" overrides at runtime.
-# -12.0 since 2026-07-15: the 14d journal's four SL closes booked -0.24 SOL
-# (-15.1% to -19.4% after slippage) while trailing TP caps wins at ~+1-2%; a
-# tighter floor trades more small losses for a thinner tail.
-STOP_LOSS_PCT = -12.0
+# -8.0: tightened from -12.0 in strategy overhaul 2026-07-20.
+# Journal analysis: avg loss was -5.66% vs avg win +2.29% (win/loss ratio 0.40).
+# A tight SL forces us to enter better, cuts losers faster, and preserves
+# capital for the next entry. With fee income offsetting small drawdowns,
+# -8% is still beyond a normal fee-earning dip but catches real dumps early.
+STOP_LOSS_PCT = -8.0
 TAKE_PROFIT_PCT = 50.0
-MAX_OOR_MINUTES = 30
+MAX_OOR_MINUTES = 45
+# OOR extension for profitable in-range positions: if PnL > this %, don't count
+# OOR time while the position still has a chance to recover — winners deserve
+# patience, losers don't. Set to 0 to disable.
+OOR_PROFIT_EXTEND_PCT = 2.0
 # Turnover fast-cycle: an OOR turnover position is idle
 # fee-capture capital, so it re-centers after minutes — not the multi-hour
 # patience of the thesis modes. The 20s monitor loop makes this cadence real.
@@ -75,7 +81,7 @@ TURNOVER_MAX_OOR_MINUTES = 2
 TURNOVER_CB_LOSS_SOL = -0.05
 SOL_MINT = "So11111111111111111111111111111111111111112"
 DEFAULT_DEPLOY_SOL = 0.5
-TRAILING_TRIGGER_PCT = 5.0
+TRAILING_TRIGGER_PCT = 4.0   # raised from 5.0 — arm earlier to catch more of the move
 TRAILING_DROP_PCT = 1.5
 MIN_FEE_TVL_24H_LIMIT = 1.0
 MIN_AGE_BEFORE_YIELD_CHECK = 60.0
@@ -182,13 +188,19 @@ def trailing_floor_pct(peak_pnl, trailing_drop_pct):
     """Profit-ratchet floor for the trailing exit. Tight near activation, locks
     progressively more profit as the peak grows, and gives big winners room to run
     instead of a flat drop — a flat drop (or another rule) tends to cut every
-    position early, capping the best wins at a few percent."""
+    position early, capping the best wins at a few percent.
+
+    2026-07-20 overhaul: raised lock percentages to fix the win/loss ratio (wins
+    avg +2.29% vs losses avg -5.66%). Winners need to compound more before exit;
+    the old ratchet was too conservative and let gains round-trip."""
+    if peak_pnl >= 30.0:
+        return max(20.0, peak_pnl * 0.75)   # big winner: lock 75%, floor 20%
     if peak_pnl >= 20.0:
-        return max(14.0, peak_pnl * 0.70)
+        return max(14.0, peak_pnl * 0.70)   # solid gain: lock 70%, floor 14%
     if peak_pnl >= 10.0:
-        return max(6.0, peak_pnl - 4.0)
+        return max(7.0, peak_pnl - 3.0)     # good gain: floor at peak-3
     if peak_pnl >= 5.0:
-        return max(2.0, peak_pnl - 2.5)
+        return max(3.0, peak_pnl - 2.0)     # small gain: floor at peak-2 (was peak-2.5)
     return peak_pnl - trailing_drop_pct
 
 def log_close(pool, pair, meta, pos_addr, pnl_pct, realized_sol, fee_per_tvl_24h,
@@ -1120,6 +1132,16 @@ def main():
                 minutes_oor = (now - oor_start) / 60.0
                 print(f"🔴 Position {pair} has been Out of Range for {minutes_oor:.1f} minutes.")
                 if minutes_oor >= oor_limit_minutes:
+                    # 4b0. Profit extension: a profitable OOR position (PnL above
+                    # OOR_PROFIT_EXTEND_PCT) is a winner drifting, not a dump.
+                    # Don't cut it on the plain OOR fuse — let it ride to a real
+                    # exit rule (trailing TP, pumped-above, or a drawdown into
+                    # loss). Fixes the journal's "wins capped at +2-3% by OOR
+                    # timeout" problem. Turnover exempt (fee density needs tight
+                    # cycling); upside OOR already has its own profit-lock below.
+                    if (meta.get("mode") != "turnover" and not oor_upside
+                            and pnl_pct >= OOR_PROFIT_EXTEND_PCT):
+                        print(f"⏳ OOR profit-extend: PnL {pnl_pct:+.2f}% >= +{OOR_PROFIT_EXTEND_PCT}% — winner drifting, not closing on OOR fuse")
                     # 4b. Downside recovery grace (deterministic port of the
                     # reference bot's "OOR downside + volume recovering →
                     # consider waiting"): if the 5m candle is green at fuse
@@ -1128,7 +1150,7 @@ def main():
                     # One-shot per OOR episode (flag resets on range re-entry);
                     # turnover keeps its 2m re-center fuse; missing m5 never
                     # extends (fail-closed to the normal fuse).
-                    if (meta.get("mode") != "turnover" and not oor_upside
+                    elif (meta.get("mode") != "turnover" and not oor_upside
                             and price_change_m5 is not None and price_change_m5 >= OOR_RECOVERY_M5_PCT
                             and not meta.get("oor_grace_used", False)):
                         meta["oor_grace_used"] = True
