@@ -800,16 +800,15 @@ def sol_bidask_bins(bin_step):
 def select_batch_strategy(c, mode):
     """Deterministic port of the deploy agent's strategy table (STEP 3).
 
-    2026-07-22 merge (originally 2026-07-19 on feat/sol-bidask-exit-overhaul):
-    sol_bidask (single-sided SOL bid-ask ladder below price) replaces the old
-    table for every thesis mode. Ground truth from the Meteora portfolio API
-    (30d, 119 closes): 47.9% winrate, PF 0.84, with earned fees fully eaten
-    by IL — the textbook two-sided symptom. The old branches all deployed
-    token exposure at entry (balanced_tight pre-swapped half,
-    single_sided_reseed swapped ALL of it); community consensus (meridian
-    default, SOL Decoder "safest", Goose DAO ~90% green days) is SOL-only
-    bid-ask below price: entry holds zero token, dumps fill bins at
-    discounts while printing fees, pumps leave 100% SOL frozen. Turnover
+    2026-07-19 rewrite: sol_bidask (single-sided SOL bid-ask ladder below
+    price) replaces the old table for every thesis mode. Ground truth from the
+    Meteora portfolio API (30d, 119 closes): 47.9% winrate, PF 0.84, with 5.4
+    SOL of fees fully eaten by IL — the textbook two-sided symptom. The old
+    branches all deployed token exposure at entry (balanced_tight pre-swapped
+    half, single_sided_reseed swapped ALL of it); community consensus
+    (meridian default, SOL Decoder "safest", Goose DAO ~90% green days) is
+    SOL-only bid-ask below price: entry holds zero token, dumps fill bins
+    at discounts while printing fees, pumps leave 100% SOL frozen. Turnover
     keeps its tight two-sided range — its thesis is fee capture from
     oscillation around the active bin, not directional meme exposure.
     """
@@ -1443,15 +1442,14 @@ def main():
         # bankrupted the tight two-sided book — the monitor's asymmetric OOR
         # rules (token-side fast fuse / SOL-side profit lock) do the exiting.
         #
-        # Orientation matters (same trap as the single_sided_reseed branch
-        # above): bins below the active bin hold tokenY, bins above hold
-        # tokenX. The SOL amount is already in the SOL slot from the default
-        # init; the ladder must sit on SOL's side of the price. SOL=Y
-        # (usual): SOL fills bins BELOW, and the token dumping walks the
-        # price DOWN into them. SOL=X: SOL fills bins ABOVE, and the token
-        # dumping walks the price (tokenY per SOL) UP into them. Putting the
-        # range on the wrong side lands ZERO liquidity — tx succeeds, rent
-        # paid, empty position.
+        # Orientation matters (same trap as the 2026-07-12 SCAM deploy above):
+        # bins below the active bin hold tokenY, bins above hold tokenX. The
+        # SOL amount is already in the SOL slot from the default init; the
+        # ladder must sit on SOL's side of the price. SOL=Y (usual): SOL
+        # fills bins BELOW, and the token dumping walks the price DOWN into
+        # them. SOL=X: SOL fills bins ABOVE, and the token dumping walks the
+        # price (tokenY per SOL) UP into them. Putting the range on the wrong
+        # side lands ZERO liquidity — tx succeeds, rent paid, empty position.
         bins_ladder = sol_bidask_bins(bin_step)
         if sol_is_x:
             bins_below = 0
