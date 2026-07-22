@@ -56,19 +56,20 @@ func GetMomentum(baseMint string) (Momentum, bool) {
 // MomentumReject applies the pipeline's momentum + downtrend gates.
 // Returns a non-empty reason when the pool should be rejected.
 func MomentumReject(m Momentum) string {
-	// Short-term dump gate (matches: reject if 5m <= -5% or 1h <= -15%).
-	if m.M5 <= -5 {
-		return fmt.Sprintf("5m %.1f%% <= -5%% (dumping)", m.M5)
+	// Strategy overhaul 2026-07-20: entry failures were mostly downtrend catches.
+	// Tighten short-horizon gates so we stop entering tokens already bleeding.
+	if m.M5 <= -3 {
+		return fmt.Sprintf("5m %.1f%% <= -3%% (dumping)", m.M5)
 	}
-	if m.H1 <= -15 {
-		return fmt.Sprintf("1h %.1f%% <= -15%% (dumping)", m.H1)
+	if m.H1 <= -7 {
+		return fmt.Sprintf("1h %.1f%% <= -7%% (dumping)", m.H1)
 	}
-	// Sustained downtrend gate (reject if 6h <= -12% or 24h <= -25%).
-	if m.H6 <= -12 {
-		return fmt.Sprintf("6h %.1f%% <= -12%% (downtrend)", m.H6)
+	// Sustained downtrend gate.
+	if m.H6 <= -10 {
+		return fmt.Sprintf("6h %.1f%% <= -10%% (downtrend)", m.H6)
 	}
-	if m.H24 <= -25 {
-		return fmt.Sprintf("24h %.1f%% <= -25%% (downtrend)", m.H24)
+	if m.H24 <= -20 {
+		return fmt.Sprintf("24h %.1f%% <= -20%% (downtrend)", m.H24)
 	}
 	return ""
 }

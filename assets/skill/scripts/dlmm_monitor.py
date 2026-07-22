@@ -169,16 +169,26 @@ def mint_cooldown_key(meta):
     mint = (meta or {}).get("base_mint", "")
     return f"sol:dlmm:cooldown:mint:{mint}" if mint and mint != SOL_MINT else None
 
-def maybe_blacklist_rug(meta, pnl_pct):
+def maybe_blacklist_rug(meta, pnl_pct, rug_event=None):
     """Add the mint (and deployer, if known) to the permanent rug blacklists
-    when a close realizes <= RUG_BLACKLIST_PNL_PCT. Callers must skip dry-run
-    closes — permanent state must never come from proxy PnL."""
-    if pnl_pct is None or pnl_pct > RUG_BLACKLIST_PNL_PCT:
+    when a close realizes <= RUG_BLACKLIST_PNL_PCT, OR when the caller passes
+    rug_event (a short reason string) for a close that is rug evidence on its
+    own regardless of realized PnL — e.g. the RUG_M5_PCT velocity gate firing.
+    A fast reaction can book a tiny/near-zero PnL on a token that just
+    cratered -20%+ in 5 minutes; without this, a well-executed emergency exit
+    would let the bot re-enter the same rug once its cooldown expires (as
+    happened with SOLdiers-SOL: two RUG velocity closes on 2026-07-19 booked
+    ~0% PnL, no blacklist, re-entered 2026-07-21 and hit the hard SL).
+    Callers must skip dry-run closes — permanent state must never come from
+    proxy PnL."""
+    is_rug = bool(rug_event) or (pnl_pct is not None and pnl_pct <= RUG_BLACKLIST_PNL_PCT)
+    if not is_rug:
         return
+    reason = rug_event or f"{pnl_pct:+.1f}% close"
     mint = (meta or {}).get("base_mint", "")
     if mint and mint != SOL_MINT:
         run_command(f"redis-cli sadd sol:dlmm:blocklist:mint \"{mint}\"")
-        print(f"⛔ RUG BLACKLIST: mint {mint[:8]}… permanently blocked ({pnl_pct:+.1f}% close)")
+        print(f"⛔ RUG BLACKLIST: mint {mint[:8]}… permanently blocked ({reason})")
     dev = (meta or {}).get("dev", "")
     if dev:
         run_command(f"redis-cli sadd sol:dlmm:blocklist:dev \"{dev}\"")
@@ -800,7 +810,7 @@ def main():
                         if mint_cd_key:
                             run_command(f"redis-cli expire \"{mint_cd_key}\" 900")
                         print(f"🚫 Cooldown shortened to 15m for {base_symbol_cd} (profitable force-close)")
-                maybe_blacklist_rug(meta, guard_pnl_pct)
+                maybe_blacklist_rug(meta, guard_pnl_pct, rug_event=(cli.reason if "rug" in reason_lower else None))
                 print(f"📊 Daily PnL booked: {realized_sol:+.4f} SOL ({guard_pnl_pct:+.2f}%)")
             # Auto-swap base token back to SOL
             base_mint = meta.get("base_mint")
@@ -1628,8 +1638,12 @@ def main():
                     print(f"🚫 Pool cooldown set 4h (low yield): {pool}")
 
                 # Permanent rug blacklist — live closes only, never proxy PnL.
+                # rug_event fires independent of realized PnL: a fast RUG_M5_PCT
+                # velocity exit can book a near-zero loss on a token that just
+                # cratered -20%+ in 5m — that crater is the rug evidence, not
+                # how well we reacted to it.
                 if not (close_res.get("dryRun") or close_res.get("dry_run") == True):
-                    maybe_blacklist_rug(meta, pnl_pct)
+                    maybe_blacklist_rug(meta, pnl_pct, rug_event=(close_reason if "rug" in reason_lower else None))
 
                 # Auto-swap base token back to SOL (unless skip_swap is active)
                 base_mint = meta.get("base_mint")

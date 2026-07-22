@@ -39,12 +39,12 @@ Pipeline supports three modes with **isolated position budgets** — each mode's
 *   Signal Weights: darwinian — entry signals of every close are correlated with realized PnL (60d window, recalc <= 1×/6h); the deploy pick prioritizes candidates strong on high-weight signals (`sol:dlmm:signal_weights`)
 
 ### Active Strategy Configuration
-*   Strategy: sol_bidask (options: sol_bidask, spot, custom_ratio_spot, balanced_tight, single_sided_reseed, fee_compounding, partial_harvest, stage_aware) — sol_bidask is the single-sided SOL bid-ask ladder (~70% downside coverage, zero token exposure at entry); the batch pick table also defaults every thesis mode to it
+*   Strategy: sol_bidask (options: sol_bidask, spot, custom_ratio_spot, balanced_tight, single_sided_reseed, fee_compounding, partial_harvest, stage_aware) — sol_bidask is the single-sided SOL bid-ask ladder (~70% downside coverage, zero token exposure at entry); the batch pick table also defaults every thesis mode to it (turnover keeps balanced_tight)
 *   Indicators Enabled: true (enable indicator timing checks before entry/exit)
 *   Indicators Preset: supertrend_break (timing presets)
 
 ### Exit Parameters
-*   Hard Stop-Loss: -25.0% (deep backstop only — the fast rails below own the tail: rug velocity gate at -20%/5m, downside-OOR fast fuse, sustained-downtrend exit. Widened from -15 on 2026-07-19: portfolio-API ground truth showed tight SLs realized -14..-24% anyway after gaps+slippage while wicking out recoverable ladder positions. Grace applies only to a young in-range position with fee/TVL ≥ 10%; an EMERGENCY floor 3pp below this always closes immediately — bypasses grace, AI holds, indicator timing, and report-only mode)
+*   Hard Stop-Loss: -25.0% (deep backstop only — the fast rails below own the tail: rug velocity gate at -20%/5m, downside-OOR fast fuse, fee-pace-death exit. Widened from -15 on 2026-07-19: portfolio-API ground truth showed tight SLs realized -14..-24% anyway after gaps+slippage while wicking out recoverable ladder positions. Grace applies only to a young in-range position with fee/TVL ≥ 10%; an EMERGENCY floor 3pp below this always closes immediately — bypasses grace, AI holds, indicator timing, and report-only mode)
 *   Trailing TP Trigger: 3.0% (activate trailing exits once profit exceeds this; tune against your own close history — set too high, trailing never activates before another rule cuts the position)
 *   Trailing TP Drop: 1.5% (floor below peak before the first ratchet tier; above +5% peak the monitor's profit ratchet takes over: peak ≥5% locks +2%, ≥10% locks +6%, ≥20% locks 70% of peak)
 *   Max Bins Pumped Above: 10 (exit if active bin exceeds upper bin by this count)
@@ -57,6 +57,7 @@ Pipeline supports three modes with **isolated position budgets** — each mode's
 *   Min Exit Liquidity: $7,000 (exit if live pool liquidity drains below this after entry — can't exit cleanly; set below the $10k entry TVL gate so fresh positions never trip it)
 *   Rug Velocity Gate (fixed in monitor): 5m candle ≤ -20% → EMERGENCY close, same class as the emergency SL floor — this fast rail is what lets the hard SL sit wide
 *   Fee-Pace-Death Exit (fixed in monitor): after 45m age, unclaimed-fee growth < 0.02% of position value across a 30m window (≈ <1%/day pace) → rotate the capital out; skips trailing-armed winners, re-baselines on fee claims
+*   Permanent Rug Blacklist (fixed in monitor, 2026-07-22): fires on a realized close ≤ -30% PnL, OR on any close whose reason names a rug pattern (e.g. the velocity gate above) regardless of realized PnL — a fast reaction can book a near-zero loss on a token that just cratered, and that crater alone is rug evidence
 
 ### Close GUARD — hold the healthy winner (applies to EVERY actor)
 

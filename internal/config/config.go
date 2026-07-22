@@ -278,7 +278,7 @@ func Load() Config {
 		CasualSeenTTL:             getdur("CASUAL_SEEN_TTL", 6*time.Hour),
 		EnableCasual:              getbool("ENABLE_CASUAL", true),
 		EnableMultiday:            getbool("ENABLE_MULTIDAY", true),
-		EnableTurnover:            getbool("ENABLE_TURNOVER", false), // experimental — see meteora.Turnover
+		EnableTurnover:            getbool("ENABLE_TURNOVER", false), // disabled: journal shows 44.8% WR, avg -3.91% per close — negative edge
 		EnableMomentumGate:        getbool("ENABLE_MOMENTUM_GATE", true),
 		EnableAuditGate:           getbool("ENABLE_AUDIT_GATE", true),
 		EnableGmgnGate:            getbool("ENABLE_GMGN_GATE", true),
@@ -291,6 +291,8 @@ func Load() Config {
 		EnableRobinhoodMature:     getbool("ROBINHOOD_MATURE", false),
 		RobinhoodDiscoverURL:      getenv("ROBINHOOD_DISCOVER_URL", ""),
 		RobinhoodWebhook:          getbool("ROBINHOOD_WEBHOOK", false),
+		// Robinhood deploy disabled by default: uni_closes.jsonl shows 30.6% WR,
+		// avg loss -23.39%, expectancy -15.04%/trade. Observe-only until venue math improves.
 		RobinhoodDeployEnabled:    getbool("ROBINHOOD_DEPLOY_ENABLED", false),
 		RobinhoodDeployModes:      getmodes("ROBINHOOD_DEPLOY_MODES", "fresh,mature"),
 		RobinhoodExecutorCmd:      getenv("ROBINHOOD_EXECUTOR_CMD", ""),
