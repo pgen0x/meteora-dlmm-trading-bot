@@ -59,18 +59,28 @@ def get_meteora_portfolio_positions(wallet_address):
         return None, str(e)
 
 # Fallback only — SOUL.md section 9 "Hard Stop-Loss" overrides at runtime.
-# -8.0: tightened from -12.0 in strategy overhaul 2026-07-20.
-# Journal analysis: avg loss was -5.66% vs avg win +2.29% (win/loss ratio 0.40).
-# A tight SL forces us to enter better, cuts losers faster, and preserves
-# capital for the next entry. With fee income offsetting small drawdowns,
-# -8% is still beyond a normal fee-earning dip but catches real dumps early.
-STOP_LOSS_PCT = -8.0
+# -25.0 since 2026-07-22 merge (was tightened to -8.0 on 2026-07-20, before
+# that -12.0): the 07-20 tightening didn't fix the tail — it just meant a
+# fast dump (SOLdiers -8.94% in 55m) got cut quickly without ever being caught
+# earlier. Tail defense moves to the FAST rails below — the rug velocity gate
+# (RUG_M5_PCT), the token-side OOR fast fuse, the fee-pace-death exit, and the
+# sustained-downtrend exit — the hard SL is now the deep backstop, not the
+# primary tail defense (SOL Decoder recommends -50..-80 with wide ranges).
+STOP_LOSS_PCT = -25.0
 TAKE_PROFIT_PCT = 50.0
 MAX_OOR_MINUTES = 45
-# OOR extension for profitable in-range positions: if PnL > this %, don't count
-# OOR time while the position still has a chance to recover — winners deserve
-# patience, losers don't. Set to 0 to disable.
-OOR_PROFIT_EXTEND_PCT = 2.0
+# Asymmetric OOR (2026-07-22 merge): the two OOR directions mean OPPOSITE
+# things for a SOL-side ladder (sol_bidask) and must not share a fuse.
+# SOL-side OOR = position fully converted to SOL, PnL frozen, nothing
+# decaying — the long MAX_OOR_MINUTES fuse is fine. Token-side OOR = every
+# bin filled into a token bag losing value every tick — sell it before the
+# decay compounds. This fast fuse applies only on the token side; the
+# one-shot green-candle recovery grace still applies on top of it. Positions
+# with unknown orientation (meta missing sol_is_x) get the patient fuse.
+# Supersedes the 2026-07-20 OOR_PROFIT_EXTEND_PCT heuristic (extend patience
+# on a profitable OOR-below position) — that targeted exactly the case this
+# fast fuse now treats as the highest-risk one (full token bag, decaying).
+OOR_DOWNSIDE_MAX_MINUTES = 5
 # Turnover fast-cycle: an OOR turnover position is idle
 # fee-capture capital, so it re-centers after minutes — not the multi-hour
 # patience of the thesis modes. The 20s monitor loop makes this cadence real.
@@ -114,17 +124,40 @@ FAST_EXIT_M5_PCT = -3.0
 # slippage). Both thresholds must trip; missing DexScreener data never fires it.
 DOWNTREND_1H_PCT = -5.0
 DOWNTREND_PNL_PCT = -5.0
-# OOR-upside profit lock: above range the position is fully converted to SOL
-# (PnL frozen, fees stopped); at or above this banked gain, close immediately
-# instead of riding the OOR fuse and risking a retrace back into range.
-# Ported from the reference bot's "OOR upside + profitable → close IMMEDIATELY";
-# threshold sits above the typical +1-2.5% trailing-TP win, so it only fires on
-# outsized pumps. Turnover mode is exempt (its OOR close feeds the re-center).
-OOR_UPSIDE_TP_PCT = 3.0
+# OOR-SOL-side profit lock: on that side the position is fully converted to
+# SOL (PnL frozen, fees stopped); at or above this banked gain, close
+# immediately instead of riding the OOR fuse and risking a retrace back into
+# range. Lowered 3.0 -> 1.5 in the 2026-07-22 merge: threshold now sits above
+# the round-trip swap cost, not the old trailing-TP win size — with the
+# sol_bidask ladder, SOL-side OOR means the whole deploy already sold into the
+# pump, so any real banked gain should bank rather than risk giving it back.
+# Turnover mode is exempt (its OOR close feeds the re-center).
+OOR_UPSIDE_TP_PCT = 1.5
 # OOR-downside recovery grace: at fuse expiry, a 5m candle at or above this
 # grants ONE extension (below) instead of closing into a recovering bounce.
 OOR_RECOVERY_M5_PCT = 1.0
 OOR_RECOVERY_GRACE_MINUTES = 5
+# Rug velocity gate: a 5m candle this deep is not volatility, it is the token
+# dying in real time — close IMMEDIATELY as an emergency (bypasses grace, AI
+# holds, indicator timing, report-only), same class as the emergency SL floor.
+# This is the fast tail defense that lets the hard SL sit wide (see
+# STOP_LOSS_PCT): the loss tail comes from dumps that gap through slow rules
+# before the wide SL ever triggers. Fail-open: missing DexScreener m5 never
+# fires it. Also feeds the permanent rug blacklist below regardless of how
+# small the realized PnL ends up — a -99% candle is rug evidence even if we
+# exit fast enough that the booked loss looks tiny.
+RUG_M5_PCT = -20.0
+# Fee-pace-death exit: fees are the product; when they stop, the position is
+# pure token risk with no income (the 30d ground truth's zero-fee-churn leak:
+# many small-loss closes earned negligible fees — capital parked in pools
+# that never printed). If unclaimed fees grow less than FEE_STALL_MIN_PCT of
+# position value across a FEE_STALL_WINDOW_MINUTES window (~1%/day pace),
+# rotate the capital out. Only fires on an aged, un-armed position with live
+# Portfolio-API fee data (fail-open); the snapshot re-baselines whenever fees
+# are claimed (unclaimed decreases).
+FEE_STALL_WINDOW_MINUTES = 30.0
+FEE_STALL_MIN_PCT = 0.02
+FEE_STALL_MIN_AGE_MINUTES = 45.0
 # Permanent rug blacklist floor: a realized close at or below this is rug
 # territory — no re-entry thesis survives it. The mint (and the deployer
 # wallet, when deploy metadata carries one) goes into a permanent Redis set
@@ -141,16 +174,26 @@ def mint_cooldown_key(meta):
     mint = (meta or {}).get("base_mint", "")
     return f"sol:dlmm:cooldown:mint:{mint}" if mint and mint != SOL_MINT else None
 
-def maybe_blacklist_rug(meta, pnl_pct):
+def maybe_blacklist_rug(meta, pnl_pct, rug_event=None):
     """Add the mint (and deployer, if known) to the permanent rug blacklists
-    when a close realizes <= RUG_BLACKLIST_PNL_PCT. Callers must skip dry-run
-    closes — permanent state must never come from proxy PnL."""
-    if pnl_pct is None or pnl_pct > RUG_BLACKLIST_PNL_PCT:
+    when a close realizes <= RUG_BLACKLIST_PNL_PCT, OR when the caller passes
+    rug_event (a short reason string) for a close that is rug evidence on its
+    own regardless of realized PnL — e.g. the RUG_M5_PCT velocity gate firing.
+    A fast reaction can book a tiny/near-zero PnL on a token that just
+    cratered -20%+ in 5 minutes; without this, a well-executed emergency exit
+    would let the bot re-enter the same rug once its cooldown expires (as
+    happened with SOLdiers-SOL: two RUG velocity closes on 2026-07-19 booked
+    ~0% PnL, no blacklist, re-entered 2026-07-21 and hit the hard SL).
+    Callers must skip dry-run closes — permanent state must never come from
+    proxy PnL."""
+    is_rug = bool(rug_event) or (pnl_pct is not None and pnl_pct <= RUG_BLACKLIST_PNL_PCT)
+    if not is_rug:
         return
+    reason = rug_event or f"{pnl_pct:+.1f}% close"
     mint = (meta or {}).get("base_mint", "")
     if mint and mint != SOL_MINT:
         run_command(f"redis-cli sadd sol:dlmm:blocklist:mint \"{mint}\"")
-        print(f"⛔ RUG BLACKLIST: mint {mint[:8]}… permanently blocked ({pnl_pct:+.1f}% close)")
+        print(f"⛔ RUG BLACKLIST: mint {mint[:8]}… permanently blocked ({reason})")
     dev = (meta or {}).get("dev", "")
     if dev:
         run_command(f"redis-cli sadd sol:dlmm:blocklist:dev \"{dev}\"")
@@ -271,6 +314,7 @@ def load_soul_dlmm_params():
         "TRAILING_DROP_PCT": float(TRAILING_DROP_PCT),
         "MAX_BINS_PUMPED_ABOVE": 10,
         "MAX_OOR_MINUTES": int(MAX_OOR_MINUTES),
+        "OOR_DOWNSIDE_MAX_MINUTES": int(OOR_DOWNSIDE_MAX_MINUTES),
         "TURNOVER_MAX_OOR_MINUTES": int(TURNOVER_MAX_OOR_MINUTES),
         "TURNOVER_CB_LOSS_SOL": float(TURNOVER_CB_LOSS_SOL),
         "MIN_AGE_BEFORE_YIELD_CHECK": float(MIN_AGE_BEFORE_YIELD_CHECK),
@@ -352,6 +396,8 @@ def load_soul_dlmm_params():
                 params["TURNOVER_CB_LOSS_SOL"] = val
             elif "Max Out of Range Minutes" in name:
                 params["MAX_OOR_MINUTES"] = int(val)
+            elif "OOR Downside Max Minutes" in name:
+                params["OOR_DOWNSIDE_MAX_MINUTES"] = int(val)
             elif "Min Age for Yield Check" in name:
                 params["MIN_AGE_BEFORE_YIELD_CHECK"] = val
             elif "Min 24h Fee/TVL for Yield Check" in name:
@@ -586,6 +632,7 @@ def main():
     trailing_drop_pct = params["TRAILING_DROP_PCT"]
     max_bins_pumped_above = params["MAX_BINS_PUMPED_ABOVE"]
     max_oor_minutes = params["MAX_OOR_MINUTES"]
+    oor_downside_max_minutes = params["OOR_DOWNSIDE_MAX_MINUTES"]
     turnover_max_oor_minutes = params["TURNOVER_MAX_OOR_MINUTES"]
     min_age_before_yield_check = params["MIN_AGE_BEFORE_YIELD_CHECK"]
     min_fee_tvl_24h_limit = params["MIN_FEE_TVL_24H_LIMIT"]
@@ -774,7 +821,7 @@ def main():
                         if mint_cd_key:
                             run_command(f"redis-cli expire \"{mint_cd_key}\" 900")
                         print(f"🚫 Cooldown shortened to 15m for {base_symbol_cd} (profitable force-close)")
-                maybe_blacklist_rug(meta, guard_pnl_pct)
+                maybe_blacklist_rug(meta, guard_pnl_pct, rug_event=(cli.reason if "rug" in reason_lower else None))
                 print(f"📊 Daily PnL booked: {realized_sol:+.4f} SOL ({guard_pnl_pct:+.2f}%)")
             # Auto-swap base token back to SOL
             base_mint = meta.get("base_mint")
@@ -1115,13 +1162,42 @@ def main():
         # these values — still one fetch per position per cycle.
         pool_liquidity_usd, price_change_h1, price_change_m5 = get_pool_liquidity_usd(pool, meta.get("base_mint"))
 
-        # 4. Out of Range (OOR) countdown check. Turnover runs a much shorter
-        # fuse: its OOR close feeds the rebalance re-center, so every extra
-        # minute waiting is idle fee-capture capital (thesis modes keep the
-        # long fuse — their OOR close is a real exit decision).
-        oor_limit_minutes = turnover_max_oor_minutes if meta.get("mode") == "turnover" else max_oor_minutes
+        # 3c. Rug velocity gate: a 5m candle at or below RUG_M5_PCT is the
+        # token dying in real time, not volatility — emergency close NOW,
+        # same class as the emergency SL floor (bypasses grace, AI holds,
+        # indicator timing, report-only; the final emergency-reason guard
+        # below restores this if the OOR/low-yield checks overwrite
+        # close_reason in between). This fast rail is what lets the hard SL
+        # sit wide. Fail-open: missing m5 never fires.
+        if price_change_m5 is not None and price_change_m5 <= RUG_M5_PCT:
+            close_reason = (f"RUG velocity dump ({price_change_m5:+.1f}% in 5m <= {RUG_M5_PCT:.0f}%) "
+                            f"— emergency exit before it goes to zero")
+            emergency_close = True
+            emergency_reason = close_reason
+
+        # 4. Out of Range (OOR) countdown check — the fuse is ASYMMETRIC by
+        # pool geometry (turnover keeps its own short fuse; its OOR close
+        # feeds the rebalance re-center). For thesis modes, direction decides:
+        # the SOL side means the position converted fully to SOL — PnL
+        # frozen, nothing decays, patient fuse. The token side means every
+        # bin filled into a token bag losing value every tick — fast fuse,
+        # sell before the decay compounds (the loss tail traces to full bags
+        # riding a slow fuse down). Orientation must be POSITIVELY known
+        # (meta.sol_is_x + resolved bin data) — unknown gets the patient
+        # fuse, never the sell-everything one.
         oor_key = f"sol:dlmm:position:{pos_addr}:oor_since"
-        oor_upside = (active_bin is not None and upper_bin is not None and active_bin > upper_bin)
+        sol_is_x_pos = bool(meta.get("sol_is_x", False))
+        oor_above = (active_bin is not None and upper_bin is not None and active_bin > upper_bin)
+        oor_below = (not in_range and active_bin is not None and upper_bin is not None
+                     and active_bin <= upper_bin)
+        oor_sol_side = (oor_below if sol_is_x_pos else oor_above)
+        oor_token_side = (oor_above if sol_is_x_pos else oor_below)
+        if meta.get("mode") == "turnover":
+            oor_limit_minutes = turnover_max_oor_minutes
+        elif oor_token_side:
+            oor_limit_minutes = min(max_oor_minutes, oor_downside_max_minutes)
+        else:
+            oor_limit_minutes = max_oor_minutes
         if not in_range:
             oor_val, _, _ = run_command(f"redis-cli get {oor_key}")
             if not oor_val or oor_val == "(nil)":
@@ -1132,25 +1208,16 @@ def main():
                 minutes_oor = (now - oor_start) / 60.0
                 print(f"🔴 Position {pair} has been Out of Range for {minutes_oor:.1f} minutes.")
                 if minutes_oor >= oor_limit_minutes:
-                    # 4b0. Profit extension: a profitable OOR position (PnL above
-                    # OOR_PROFIT_EXTEND_PCT) is a winner drifting, not a dump.
-                    # Don't cut it on the plain OOR fuse — let it ride to a real
-                    # exit rule (trailing TP, pumped-above, or a drawdown into
-                    # loss). Fixes the journal's "wins capped at +2-3% by OOR
-                    # timeout" problem. Turnover exempt (fee density needs tight
-                    # cycling); upside OOR already has its own profit-lock below.
-                    if (meta.get("mode") != "turnover" and not oor_upside
-                            and pnl_pct >= OOR_PROFIT_EXTEND_PCT):
-                        print(f"⏳ OOR profit-extend: PnL {pnl_pct:+.2f}% >= +{OOR_PROFIT_EXTEND_PCT}% — winner drifting, not closing on OOR fuse")
                     # 4b. Downside recovery grace (deterministic port of the
                     # reference bot's "OOR downside + volume recovering →
                     # consider waiting"): if the 5m candle is green at fuse
                     # expiry, price is walking back toward the range — one
                     # 5-minute extension instead of closing into the bounce.
-                    # One-shot per OOR episode (flag resets on range re-entry);
-                    # turnover keeps its 2m re-center fuse; missing m5 never
-                    # extends (fail-closed to the normal fuse).
-                    elif (meta.get("mode") != "turnover" and not oor_upside
+                    # Scoped to the token side (the fast fuse) — the SOL
+                    # side's long fuse rarely needs it. One-shot per OOR
+                    # episode (flag resets on range re-entry); turnover keeps
+                    # its own fuse; missing m5 never extends (fail-closed).
+                    if (meta.get("mode") != "turnover" and oor_token_side
                             and price_change_m5 is not None and price_change_m5 >= OOR_RECOVERY_M5_PCT
                             and not meta.get("oor_grace_used", False)):
                         meta["oor_grace_used"] = True
@@ -1158,21 +1225,30 @@ def main():
                             run_command(f"redis-cli set \"sol:dlmm:position:{pos_addr}\" '{json.dumps(meta)}'")
                         run_command(f"redis-cli set {oor_key} {now - int((oor_limit_minutes - OOR_RECOVERY_GRACE_MINUTES) * 60)}")
                         print(f"⏳ OOR recovery grace: 5m candle {price_change_m5:+.1f}% >= +{OOR_RECOVERY_M5_PCT}% — extending fuse {OOR_RECOVERY_GRACE_MINUTES}m (one-shot)")
+                    elif oor_token_side and meta.get("mode") != "turnover":
+                        # Token-side OOR = full token bag; "dump" routes the
+                        # close through the dump path (2h cooldown, wide swap
+                        # impact, no rebalance re-center) — sell-everything,
+                        # not a re-center candidate. No profit exemption: a
+                        # full token bag keeps decaying regardless of PnL.
+                        close_reason = (f"OOR token-side dump exit ({minutes_oor:.1f}m out of range, fast fuse "
+                                        f"{oor_limit_minutes}m) — position fully converted to token, selling before decay")
                     else:
                         close_reason = f"Out of Range for {minutes_oor:.1f}m (limit {oor_limit_minutes}m)"
-            # 4a. OOR-upside profit lock (ported from the reference bot's "OOR
-            # upside + profitable → close IMMEDIATELY"). Above range the
-            # position has fully converted to SOL: PnL is frozen and fees have
-            # stopped, so the fuse only buys a chance for price to fall back
-            # INTO range — which, with a strong win banked, hands the profit
-            # back before earning resumes. Bank it now. Checked after the
-            # countdown so this reason wins over the plain OOR reason (routes
-            # as a profitable exit: 15m cooldown, no rebalance re-center).
-            # Turnover exempt — its OOR close IS the re-center trigger.
-            if (oor_upside and pnl_pct >= OOR_UPSIDE_TP_PCT
+            # 4a. OOR-SOL-side profit lock (ported from the reference bot's
+            # "OOR upside + profitable → close IMMEDIATELY"). On that side the
+            # position has fully converted to SOL: PnL is frozen and fees
+            # have stopped, so the fuse only buys a chance for price to fall
+            # back INTO range — which, with a real gain banked, hands the
+            # profit back before earning resumes. Bank it now. Checked after
+            # the countdown so this reason wins over the plain OOR reason
+            # (routes as a profitable exit: 15m cooldown, no rebalance
+            # re-center). Turnover exempt — its OOR close IS the re-center
+            # trigger.
+            if (oor_sol_side and pnl_pct >= OOR_UPSIDE_TP_PCT
                     and meta.get("mode") != "turnover"):
-                close_reason = (f"OOR upside profit lock ({pnl_pct:+.2f}% >= +{OOR_UPSIDE_TP_PCT}% "
-                                f"with price above range) — banking the frozen win")
+                close_reason = (f"OOR SOL-side profit lock ({pnl_pct:+.2f}% >= +{OOR_UPSIDE_TP_PCT}% "
+                                f"with position fully in SOL) — banking the frozen win")
         else:
             # Clear OOR timer + re-arm the recovery grace for the next episode
             run_command(f"redis-cli del {oor_key}")
@@ -1222,6 +1298,39 @@ def main():
                 and price_change_m5 <= FAST_EXIT_M5_PCT and pnl_pct >= TRAILING_MIN_LOCK_PCT):
             close_reason = (f"Fast-out dump exit (5m {price_change_m5:+.1f}% <= {FAST_EXIT_M5_PCT}% "
                             f"with PnL {pnl_pct:+.2f}%, peak {peak_pnl:+.2f}%) — realizing before floor gap-through")
+
+        # 5e. Fee-pace-death exit: fees are the product — when the stream stops,
+        # the position is pure token risk earning nothing. Snapshot unclaimed
+        # fees in meta; if growth across the window is below FEE_STALL_MIN_PCT
+        # of position value (~1%/day pace), rotate the capital out. Requires
+        # live Portfolio-API fee data (fail-open), a settled position (age >=
+        # FEE_STALL_MIN_AGE_MINUTES), and skips armed winners — the trailing
+        # ratchet owns those.
+        if (not close_reason and bp and not trailing_active
+                and age_minutes >= FEE_STALL_MIN_AGE_MINUTES):
+            unclaimed_fees_sol = float(bp.get("unclaimed_fees_sol") or 0.0)
+            position_value_sol = float(bp.get("balances_sol") or 0.0)
+            snap_sol = meta.get("fee_snap_sol")
+            snap_at = meta.get("fee_snap_at")
+            if snap_sol is None or snap_at is None or unclaimed_fees_sol < float(snap_sol):
+                # First sighting, or fees were claimed (unclaimed dropped) — (re)baseline.
+                meta["fee_snap_sol"] = unclaimed_fees_sol
+                meta["fee_snap_at"] = now
+                if not is_dry_run_stored:
+                    run_command(f"redis-cli set \"sol:dlmm:position:{pos_addr}\" '{json.dumps(meta)}'")
+            elif (now - float(snap_at)) / 60.0 >= FEE_STALL_WINDOW_MINUTES:
+                window_min = (now - float(snap_at)) / 60.0
+                growth_sol = unclaimed_fees_sol - float(snap_sol)
+                growth_pct = (growth_sol / position_value_sol * 100.0) if position_value_sol > 0 else None
+                if growth_pct is not None and growth_pct < FEE_STALL_MIN_PCT:
+                    close_reason = (f"Fee pace death (+{growth_sol:.5f} SOL fees in {window_min:.0f}m = "
+                                    f"{growth_pct:.3f}% of position < {FEE_STALL_MIN_PCT}%) — rotating dead capital")
+                else:
+                    # Pace healthy — roll the window forward.
+                    meta["fee_snap_sol"] = unclaimed_fees_sol
+                    meta["fee_snap_at"] = now
+                    if not is_dry_run_stored:
+                        run_command(f"redis-cli set \"sol:dlmm:position:{pos_addr}\" '{json.dumps(meta)}'")
 
         # An emergency reason must not be diluted by a softer rule that fired after it
         # (pumped-above / OOR / low-yield all overwrite close_reason unconditionally).
@@ -1537,8 +1646,12 @@ def main():
                     print(f"🚫 Pool cooldown set 4h (low yield): {pool}")
 
                 # Permanent rug blacklist — live closes only, never proxy PnL.
+                # rug_event fires independent of realized PnL: a fast RUG_M5_PCT
+                # velocity exit can book a near-zero loss on a token that just
+                # cratered -20%+ in 5m — that crater is the rug evidence, not
+                # how well we reacted to it.
                 if not (close_res.get("dryRun") or close_res.get("dry_run") == True):
-                    maybe_blacklist_rug(meta, pnl_pct)
+                    maybe_blacklist_rug(meta, pnl_pct, rug_event=(close_reason if "rug" in reason_lower else None))
 
                 # Auto-swap base token back to SOL (unless skip_swap is active)
                 base_mint = meta.get("base_mint")

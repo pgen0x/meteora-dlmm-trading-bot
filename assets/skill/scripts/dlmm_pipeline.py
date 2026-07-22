@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 import os
 import re
+import math
 from local_indicators import check_local_indicators
 from tz_util import local_time_str
 
@@ -783,37 +784,46 @@ def apply_batch_conviction(candidates, mode="multiday"):
     return kept
 
 
+# sol_bidask price coverage below the active bin. Community-converged range is
+# -65..-75% (linclonlogging's "bread'n'butter"/sawtooth: 69-bin ladders to -74%);
+# 0.70 lands inside it at bin steps 80-125 before the MAX_BINS_BELOW clamp.
+SOL_BIDASK_COVERAGE = 0.70
+
+def sol_bidask_bins(bin_step):
+    """Bins below the active bin so the ladder covers SOL_BIDASK_COVERAGE of
+    downside. Bins compound: price after n down-bins = (1+step)^-n, so
+    n = ln(1-coverage) / -ln(1+step). Clamped to the deployable band."""
+    step = max(bin_step, 1) / 10000.0
+    need = int(math.ceil(math.log(1.0 - SOL_BIDASK_COVERAGE) / -math.log1p(step)))
+    return max(MIN_BINS_BELOW, min(MAX_BINS_BELOW, need))
+
 def select_batch_strategy(c, mode):
     """Deterministic port of the deploy agent's strategy table (STEP 3).
 
-    Thresholds compare the raw signal fields exactly as the agent prompt did
-    (fee_tvl_ratio stays window-scoped for 30m modes). Returns None when no
-    rule matches so the caller falls back to the SOUL.md default, which
-    handles the out-of-band volatility cases (stage_aware/spot).
+    2026-07-22 merge (originally 2026-07-19 on feat/sol-bidask-exit-overhaul):
+    sol_bidask (single-sided SOL bid-ask ladder below price) replaces the old
+    table for every thesis mode. Ground truth from the Meteora portfolio API
+    (30d, 119 closes): 47.9% winrate, PF 0.84, with earned fees fully eaten
+    by IL — the textbook two-sided symptom. The old branches all deployed
+    token exposure at entry (balanced_tight pre-swapped half,
+    single_sided_reseed swapped ALL of it); community consensus (meridian
+    default, SOL Decoder "safest", Goose DAO ~90% green days) is SOL-only
+    bid-ask below price: entry holds zero token, dumps fill bins at
+    discounts while printing fees, pumps leave 100% SOL frozen. Turnover
+    keeps its tight two-sided range — its thesis is fee capture from
+    oscillation around the active bin, not directional meme exposure.
     """
-    organic = float(c.get("organic_score") or 0)
-    mcap = float(c.get("mcap") or 0)
-    fee_tvl = float(c.get("fee_tvl_ratio") or 0)
-    vol = float(c.get("volatility") or 0)
     if mode == "turnover":
         # Fee-capture thesis: tight two-sided range, ranked by turnover not price.
         return "balanced_tight"
-    if organic > 85 and mcap < 2_000_000 and fee_tvl > 15:
-        return "single_sided_reseed"
-    if vol < 2 and fee_tvl > 8 and mcap > 2_000_000:
-        return "fee_compounding"
-    if 1.5 <= vol <= 8:
-        # Default for meme pools: both sides earn fees and pumps realize
-        # profit bin-by-bin into SOL.
-        return "balanced_tight"
-    return None
+    return "sol_bidask"
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--analyze-only", action="store_true", help="Screen pools, print all candidates JSON, exit without deploying")
-    parser.add_argument("--strategy", type=str, default=None, help="Override SOUL.md strategy (spot, custom_ratio_spot, balanced_tight, single_sided_reseed, fee_compounding, partial_harvest)")
+    parser.add_argument("--strategy", type=str, default=None, help="Override SOUL.md strategy (sol_bidask, spot, custom_ratio_spot, balanced_tight, single_sided_reseed, fee_compounding, partial_harvest)")
     parser.add_argument("--pool", type=str, default=None, help="Deploy a specific pool address instead of auto-selecting winner")
     parser.add_argument("--from-signal", dest="from_signal", type=str, default=None, help="JSON of a pre-screened candidate record from the mdtb signal daemon. Skips discovery+screen and deploys this exact pool; live gates (holding/cooldown/momentum/rent) still run.")
     parser.add_argument("--from-batch", dest="from_batch", type=str, default=None, help="JSON ARRAY of pre-screened candidate records (the full mdtb signal payload). Deterministically re-ranks the batch (GMGN/PVP/prior-PnL heuristics + darwinian signal weights), then deploys the strongest candidate that clears every live gate — falling back to the runner-up when a gate rejects the pick. Replaces the LLM agent's pick step.")
@@ -1196,14 +1206,23 @@ def main():
         for c in valid_candidates:
             if soul_strat == "stage_aware":
                 _, bb, _, _ = select_stage_strategy(deploy_sol, c["volatility"], c.get("bin_step", 100), mode=mode)
+            elif soul_strat == "sol_bidask":
+                bb = sol_bidask_bins(c.get("bin_step", 100))
             else:
                 c_bin_step_pct = max(c.get("bin_step", 100), 1) / 100.0
                 c_phys = int((c["volatility"] * 2.5) / c_bin_step_pct)
                 c_lin = int(MIN_BINS_BELOW + (c["volatility"] / 5.0) * (MAX_BINS_BELOW - MIN_BINS_BELOW))
                 bb = max(MIN_BINS_BELOW, min(MAX_BINS_BELOW, max(c_phys, c_lin // 2)))
             bins_by_candidate[c["pool"]] = bb
-            # Probe a symmetric range (widest the strategy would use) — conservative superset.
-            cov = check_bin_coverage(c["pool"], bb, bb)
+            # Probe the deploy shape: one-sided on SOL's side for sol_bidask
+            # (below when SOL=Y, above when SOL=X), else the symmetric superset.
+            if soul_strat == "sol_bidask":
+                if c.get("sol_is_x", False):
+                    cov = check_bin_coverage(c["pool"], 0, bb)
+                else:
+                    cov = check_bin_coverage(c["pool"], bb, 0)
+            else:
+                cov = check_bin_coverage(c["pool"], bb, bb)
             if cov is not None and not cov.get("deployable", True):
                 print(f"Skipping {c['name']} - deploy range needs {cov.get('missing', 0)} new bin-array init "
                       f"(~{cov.get('totalFee', 0):.4f} SOL non-refundable rent) — excluded from AI pick")
@@ -1260,10 +1279,23 @@ def main():
         for c in valid_candidates:
             v = c["volatility"]
             bsp = max(c.get("bin_step", 100), 1) / 100.0
-            bp = int((v * 2.5) / bsp)
-            bl = int(MIN_BINS_BELOW + (v / 5.0) * (MAX_BINS_BELOW - MIN_BINS_BELOW))
-            bb = max(MIN_BINS_BELOW, min(MAX_BINS_BELOW, max(bp, bl // 2)))
-            cov = check_bin_coverage(c["pool"], bb, bb)
+            # Probe the range the RESOLVED strategy will actually deploy —
+            # sol_bidask ladders are wider/one-sided vs the symmetric spot
+            # superset, and probing the wrong shape lets a deploy hit
+            # unprobed bin-array init rent.
+            prospective = cli.strategy or (select_batch_strategy(c, mode) if batch_mode else params.get("STRATEGY", "spot"))
+            if prospective == "sol_bidask":
+                bb = sol_bidask_bins(c.get("bin_step", 100))
+                # Ladder sits on SOL's side: below when SOL=Y, above when SOL=X.
+                if c.get("sol_is_x", False):
+                    cov = check_bin_coverage(c["pool"], 0, bb)
+                else:
+                    cov = check_bin_coverage(c["pool"], bb, 0)
+            else:
+                bp = int((v * 2.5) / bsp)
+                bl = int(MIN_BINS_BELOW + (v / 5.0) * (MAX_BINS_BELOW - MIN_BINS_BELOW))
+                bb = max(MIN_BINS_BELOW, min(MAX_BINS_BELOW, max(bp, bl // 2)))
+                cov = check_bin_coverage(c["pool"], bb, bb)
             if cov is not None and not cov.get("deployable", True):
                 print(f"Skipping {c['name']} - deploy range needs {cov.get('missing', 0)} new bin-array init "
                       f"(~{cov.get('totalFee', 0):.4f} SOL non-refundable rent)")
@@ -1402,6 +1434,36 @@ def main():
         print(f"Strategy: stage_aware -> {stage_label} ({deploy_sol} SOL). "
               f"bins_below: {bins_below}, bins_above: {bins_above}, type: {strategy_type}.")
 
+    elif strategy == "sol_bidask":
+        # Single-sided SOL bid-ask ladder on the token's DOWNSIDE (no pre-swap,
+        # zero token exposure at entry). bid_ask weights liquidity toward the
+        # deep bins, so a flush fills into size at real discounts; a pump
+        # leaves the position 100% SOL with nothing at risk. Wide coverage
+        # (~-70%) trades per-bin fee share for surviving the moves that
+        # bankrupted the tight two-sided book — the monitor's asymmetric OOR
+        # rules (token-side fast fuse / SOL-side profit lock) do the exiting.
+        #
+        # Orientation matters (same trap as the single_sided_reseed branch
+        # above): bins below the active bin hold tokenY, bins above hold
+        # tokenX. The SOL amount is already in the SOL slot from the default
+        # init; the ladder must sit on SOL's side of the price. SOL=Y
+        # (usual): SOL fills bins BELOW, and the token dumping walks the
+        # price DOWN into them. SOL=X: SOL fills bins ABOVE, and the token
+        # dumping walks the price (tokenY per SOL) UP into them. Putting the
+        # range on the wrong side lands ZERO liquidity — tx succeeds, rent
+        # paid, empty position.
+        bins_ladder = sol_bidask_bins(bin_step)
+        if sol_is_x:
+            bins_below = 0
+            bins_above = bins_ladder
+        else:
+            bins_below = bins_ladder
+            bins_above = 0
+        strategy_type = "bid_ask"
+        print(f"Strategy: sol_bidask (SOL-only Bid-Ask ladder, SOL is token{'X' if sol_is_x else 'Y'}). "
+              f"bins_below: {bins_below}, bins_above: {bins_above} "
+              f"(~{(1 - (1 + max(bin_step,1)/10000.0) ** -bins_ladder) * 100:.0f}% downside coverage).")
+
     # Pre-deploy checks: momentum gate + fee/TVL freshness + depth/exit-liquidity gate
     base_mint = winner.get("base_mint", "")
     if not base_mint:
@@ -1529,6 +1591,9 @@ def main():
         "deployed_at": ts,
         "tx_hash": tx_hash,
         "strategy": strategy,
+        # Pool orientation — the monitor needs it to tell which OOR direction
+        # is the token bag (SOL=Y: below range; SOL=X: above range).
+        "sol_is_x": sol_is_x,
         "amount_x": amount_x,
         "amount_y": amount_y,
         "mode": mode,
